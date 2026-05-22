@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/api.ts","./src/main.tsx","./src/vite-env.d.ts","./src/views/entrypointnode.tsx","./src/views/nodeconfigdrawer.tsx","./src/views/nodepalette.tsx","./src/views/projectcanvas.tsx","./src/views/projectlist.tsx","./src/views/schemaform.tsx"],"version":"5.9.3"}

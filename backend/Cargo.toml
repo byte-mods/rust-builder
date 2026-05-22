@@ -1,0 +1,43 @@
+[package]
+name = "rust_no_code_studio"
+version = "0.1.0"
+edition = "2021"
+description = "Studio server for the rust_no_code visual application builder."
+license = "Apache-2.0 OR MIT"
+publish = false
+
+[lib]
+name = "rust_no_code_studio"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rust_no_code_studio"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.7", features = ["ws"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "process", "fs", "sync", "time", "io-util"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+thiserror = "1"
+anyhow = "1"
+time = { version = "0.3", features = ["serde-well-known", "macros"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+dashmap = "6"
+schemars = { version = "0.8", features = ["derive"] }
+jsonschema = { version = "0.18", default-features = false }
+syn = { version = "2", features = ["full", "parsing"] }
+quote = "1"
+proc-macro2 = "1"
+prettyplease = "0.2"
+toml_edit = "0.22"
+prost-build = "0.14"
+typify = "0.6"
+
+[dev-dependencies]
+tower = { version = "0.4", features = ["util"] }
+http-body-util = "0.1"
+tempfile = "3"
