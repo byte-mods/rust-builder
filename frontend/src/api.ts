@@ -63,6 +63,7 @@ export interface GraphNode {
   position: Position;
   config: unknown;
   label?: string;
+  comment?: string;
 }
 
 export interface GraphEdge {
@@ -308,12 +309,24 @@ export async function saveGraph(
 
 // ---- Build orchestration (Section 6) ---------------------------------------
 
+export interface ParsedDiagnostic {
+  file_path: string;
+  line: number;
+  column: number;
+  severity: string; // "error" | "warning"
+  message: string;
+  code?: string;
+  node_id?: string;
+}
+
 export interface BuildEvent {
-  stream: "start" | "stdout" | "stderr" | "exit";
+  stream: "start" | "stdout" | "stderr" | "exit" | "diagnostic";
   line?: string;
   command?: string;
   code?: number;
+  diagnostic?: ParsedDiagnostic;
 }
+
 
 /// Convert the HTTP API base to a WebSocket base.
 function wsBase(): string {
@@ -337,3 +350,158 @@ export async function triggerBuild(
     expectEmptyBody: true,
   });
 }
+
+export interface PerformanceStats {
+  throughput: number;
+  avg_latency_us: number;
+  p99_latency_us: number;
+}
+
+export interface RunEvent {
+  stream: "start" | "stdout" | "stderr" | "exit" | "stop" | "metrics" | "debug_state";
+  line?: string;
+  command?: string;
+  code?: number | null;
+  reason?: string;
+  node_id?: string;
+  state?: string;
+  value?: string;
+  metrics?: Record<string, PerformanceStats>;
+}
+
+export interface RunStatus {
+  running: boolean;
+  slug: string;
+}
+
+export function runWebSocketUrl(slug: string): string {
+  return `${wsBase()}/ws/run/${encodeURIComponent(slug)}`;
+}
+
+export async function triggerRun(slug: string, signal?: AbortSignal): Promise<void> {
+  await request<void>("POST", `/api/projects/${encodeURIComponent(slug)}/run`, {
+    signal,
+    expectEmptyBody: true,
+  });
+}
+
+export async function stopRun(slug: string, signal?: AbortSignal): Promise<void> {
+  await request<void>("POST", `/api/projects/${encodeURIComponent(slug)}/stop`, {
+    signal,
+    expectEmptyBody: true,
+  });
+}
+
+export async function triggerTest(slug: string, signal?: AbortSignal): Promise<void> {
+  await request<void>("POST", `/api/projects/${encodeURIComponent(slug)}/test`, {
+    signal,
+    expectEmptyBody: true,
+  });
+}
+
+export async function triggerDebug(
+  slug: string,
+  breakpoints?: string[],
+  signal?: AbortSignal,
+): Promise<void> {
+  await request<void>("POST", `/api/projects/${encodeURIComponent(slug)}/debug`, {
+    body: breakpoints ? { breakpoints } : undefined,
+    signal,
+    expectEmptyBody: true,
+  });
+}
+
+export async function sendDebugAction(
+  slug: string,
+  action: "resume" | "step",
+  signal?: AbortSignal,
+): Promise<void> {
+  await request<void>("POST", `/api/projects/${encodeURIComponent(slug)}/debug/action`, {
+    body: { action },
+    signal,
+    expectEmptyBody: true,
+  });
+}
+
+
+export async function fetchRunStatus(slug: string, signal?: AbortSignal): Promise<RunStatus> {
+  return request<RunStatus>("GET", `/api/projects/${encodeURIComponent(slug)}/status`, {
+    signal,
+  });
+}
+
+export interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+/// `POST /api/projects/:slug/llm/generate-flow` — completely generate or heavily modify flow graph via LLM.
+export async function generateFlow(
+  slug: string,
+  prompt: string,
+  history?: ChatMessage[],
+  signal?: AbortSignal,
+): Promise<Graph> {
+  return request<Graph>("POST", `/api/projects/${encodeURIComponent(slug)}/llm/generate-flow`, {
+    body: { prompt, history },
+    signal,
+  });
+}
+
+/// `POST /api/projects/:slug/llm/refine-flow` — make minor refinements or tweaks to the visual graph via LLM.
+export async function refineFlow(
+  slug: string,
+  prompt: string,
+  history?: ChatMessage[],
+  signal?: AbortSignal,
+): Promise<Graph> {
+  return request<Graph>("POST", `/api/projects/${encodeURIComponent(slug)}/llm/refine-flow`, {
+    body: { prompt, history },
+    signal,
+  });
+}
+
+export interface VulnerabilityReport {
+  crate_name: string;
+  version: string;
+  advisory_id: string;
+  summary: string;
+  severity: string;
+  url: string;
+}
+
+export interface SecretLeak {
+  node_id: string;
+  field: string;
+  secret_type: string;
+  masked_value: string;
+  message: string;
+}
+
+export interface SecureCodeViolation {
+  node_id: string;
+  violation_type: string;
+  message: string;
+  severity: string;
+  advice: string;
+}
+
+export interface SecurityAuditReport {
+  vulnerabilities: VulnerabilityReport[];
+  leaked_secrets: SecretLeak[];
+  secure_code_violations: SecureCodeViolation[];
+  security_score: number;
+}
+
+/// `POST /api/projects/:slug/audit` — run security audit static analysis scans on the project
+export async function runSecurityAudit(
+  slug: string,
+  signal?: AbortSignal,
+): Promise<SecurityAuditReport> {
+  return request<SecurityAuditReport>(
+    "POST",
+    `/api/projects/${encodeURIComponent(slug)}/audit`,
+    { signal }
+  );
+}
+

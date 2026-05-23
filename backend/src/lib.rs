@@ -20,6 +20,7 @@ use axum::{routing::get, Json, Router};
 use serde::Serialize;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
+use crate::codegen::CodegenCache;
 use crate::projects::ProjectStore;
 use crate::run::RunManager;
 use crate::templates::TemplateRegistry;
@@ -38,6 +39,10 @@ pub struct AppState {
     pub registry: Arc<TemplateRegistry>,
     pub build_manager: Arc<crate::build::BuildManager>,
     pub run_manager: Arc<RunManager>,
+    /// S16: per-slug graph-hash cache. Build/Run/Test/Debug call
+    /// `regen_if_changed` to skip codegen when the graph hasn't changed
+    /// since the last click.
+    pub codegen_cache: CodegenCache,
 }
 
 impl AppState {
@@ -47,6 +52,7 @@ impl AppState {
             registry,
             build_manager: Arc::new(crate::build::BuildManager::new()),
             run_manager: Arc::new(RunManager::new()),
+            codegen_cache: CodegenCache::new(),
         }
     }
 }

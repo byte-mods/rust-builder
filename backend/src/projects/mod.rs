@@ -10,6 +10,8 @@ pub mod handlers;
 pub mod store;
 pub mod types;
 pub mod validation;
+pub mod llm;
+pub mod security;
 
 pub use handlers::projects_router;
 pub use store::ProjectStore;

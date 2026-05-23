@@ -45,7 +45,7 @@ async fn get_json(app: Router, uri: &str) -> (StatusCode, Value) {
 }
 
 #[tokio::test]
-async fn test_list_templates_returns_all_eleven_builtins_sorted() {
+async fn test_list_templates_returns_expected_builtin_inventory_sorted() {
     let (app, _dir) = harness().await;
     let (status, body) = get_json(app, "/api/templates").await;
     assert_eq!(status, StatusCode::OK);
@@ -57,14 +57,52 @@ async fn test_list_templates_returns_all_eleven_builtins_sorted() {
             "core.dto",
             "core.entry_point",
             "core.service",
+            "custom.block",
             "http.handler",
             "http.route",
             "integration.consumer.placeholder",
+            "integration.db_writer",
+            "integration.file_tail",
+            "integration.http_client",
+            "integration.kafka_consumer",
+            "integration.kafka_producer",
+            "integration.redis",
+            "integration.scheduler",
             "integration.scheduler.placeholder",
+            "integration.sql_connector",
+            "language.await",
+            "language.clone",
+            "language.enum",
+            "language.fn",
+            "language.if_else",
+            "language.loop",
+            "language.match",
+            "language.pointer",
+            "language.propagate",
+            "language.struct",
             "observability.logger",
             "parser.json",
             "parser.protobuf",
             "parser.xml",
+            "stream.filter",
+            "stream.join",
+            "stream.map",
+            "stream.pattern",
+            "stream.select",
+            "stream.union",
+            "stream.window",
+            "tokio.broadcast",
+            "tokio.interval",
+            "tokio.join",
+            "tokio.mpsc",
+            "tokio.mutex",
+            "tokio.notify",
+            "tokio.rwlock",
+            "tokio.select",
+            "tokio.semaphore",
+            "tokio.sleep",
+            "tokio.spawn",
+            "tokio.spawn_blocking",
         ],
         "templates must be returned in lexicographic id order"
     );

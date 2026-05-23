@@ -85,6 +85,14 @@ pub enum ApiError {
     /// distinguish (typically a bug or transient infrastructure failure).
     #[error("internal: {0}")]
     Internal(String),
+
+    /// ANTHROPIC_API_KEY environment variable is not set.
+    #[error("ANTHROPIC_API_KEY environment variable is not set")]
+    ApiKeyMissing,
+
+    /// Anthropic API error.
+    #[error("Anthropic API error: {0}")]
+    LlmError(String),
 }
 
 /// Wire shape for the JSON body returned on every error response.
@@ -151,6 +159,16 @@ impl ApiError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal",
                 "an internal error occurred",
+            ),
+            ApiError::ApiKeyMissing => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_key_missing",
+                "ANTHROPIC_API_KEY environment variable is not set",
+            ),
+            ApiError::LlmError(_) => (
+                StatusCode::BAD_REQUEST,
+                "llm_error",
+                "an error occurred while generating the flow graph",
             ),
         }
     }

@@ -1,12 +1,15 @@
 import { useMemo } from "react";
-import { type Template } from "../api";
+import { type Template, type ParsedDiagnostic } from "../api";
 import SchemaForm from "./SchemaForm";
 
 interface NodeConfigDrawerProps {
   nodeId: string;
   templateId: string;
   config: unknown;
+  comment?: string;
+  onCommentChange: (comment: string) => void;
   templates: Template[];
+  diagnostics: ParsedDiagnostic[];
   onChange: (config: unknown) => void;
   onClose: () => void;
 }
@@ -17,7 +20,10 @@ export default function NodeConfigDrawer({
   nodeId,
   templateId,
   config,
+  comment = "",
+  onCommentChange,
   templates,
+  diagnostics,
   onChange,
   onClose,
 }: NodeConfigDrawerProps): JSX.Element {
@@ -47,11 +53,43 @@ export default function NodeConfigDrawer({
         </div>
 
         {template ? (
-          <SchemaForm schema={template.config_schema} value={config} onChange={onChange} />
+          <SchemaForm
+            schema={template.config_schema}
+            value={config}
+            diagnostics={diagnostics}
+            onChange={onChange}
+          />
         ) : (
           <p className="muted">template not found</p>
         )}
+
+        <div className="drawer-comment-section" style={{ marginTop: "1.25rem", borderTop: "1px solid rgba(127, 127, 127, 0.18)", paddingTop: "0.8rem" }}>
+          <label style={{ fontSize: "0.72rem", textTransform: "uppercase", letterSpacing: "0.06em", color: "rgba(127, 127, 127, 0.9)", display: "block", marginBottom: "0.4rem", fontWeight: 600 }}>
+            Node Note / Comment
+          </label>
+          <textarea
+            style={{
+              width: "100%",
+              boxSizing: "border-box",
+              padding: "0.45rem 0.6rem",
+              borderRadius: "6px",
+              border: "1px solid rgba(127, 127, 127, 0.25)",
+              background: "rgba(0, 0, 0, 0.25)",
+              color: "white",
+              fontFamily: "inherit",
+              fontSize: "0.8rem",
+              resize: "vertical",
+              lineHeight: "1.4",
+              outline: "none"
+            }}
+            placeholder="Describe what this node does or note down config details..."
+            value={comment}
+            onChange={(e) => onCommentChange(e.target.value)}
+            rows={3}
+          />
+        </div>
       </div>
     </aside>
   );
 }
+

@@ -29,6 +29,14 @@ use tokio::process::Command;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
+/// Performance profiling statistics per visual node (S21).
+#[derive(Debug, Clone, Serialize)]
+pub struct PerformanceStats {
+    pub throughput: usize,
+    pub avg_latency_us: u64,
+    pub p99_latency_us: u64,
+}
+
 /// One line or lifecycle event emitted by a running process.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case", tag = "stream")]
@@ -43,6 +51,16 @@ pub enum RunEvent {
     Exit { code: Option<i32> },
     /// Run was manually stopped by the user.
     Stop { reason: String },
+    /// Step-debugger event (S13).
+    DebugState {
+        node_id: String,
+        state: String,
+        value: String,
+    },
+    /// Performance profiling metrics update (S21).
+    Metrics {
+        metrics: std::collections::HashMap<String, PerformanceStats>,
+    },
 }
 
 /// Errors the run lifecycle manager can return.
@@ -104,12 +122,18 @@ impl RunManager {
     /// Spawn `cargo run` for `slug` in `project_dir` and broadcast output to
     /// any WebSocket subscribers.
     ///
+    /// `env` is appended to the child's environment unchanged. S16 uses this
+    /// to route `/debug` through the same code path as `/run` while injecting
+    /// `RUST_LOG=debug` + `RUST_BACKTRACE=full`; production `/run` callers
+    /// pass an empty slice and get the unmodified environment.
+    ///
     /// Returns immediately once the process is spawned; the actual run runs
     /// in background tasks.
     pub async fn start_run(
         &self,
         slug: &str,
         project_dir: PathBuf,
+        env: &[(&str, &str)],
     ) -> Result<(), RunError> {
         if self.processes.contains_key(slug) {
             return Err(RunError::AlreadyRunning(slug.to_string()));
@@ -120,8 +144,12 @@ impl RunManager {
         cmd.current_dir(&project_dir)
             .arg("run")
             .arg("--message-format=short");
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
         cmd.stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stderr(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::piped());
 
         let mut child = cmd.spawn()?;
         let command_str = "cargo run --message-format=short".to_string();
@@ -139,10 +167,86 @@ impl RunManager {
         let tx_stderr = tx.clone();
         let _slug_owned = slug.to_string();
 
+        // S21: Performance profiling aggregator state
+        let metrics_data = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<String, Vec<u128>>::new()));
+        let metrics_data_clone = std::sync::Arc::clone(&metrics_data);
+        let tx_metrics = tx.clone();
+        let slug_str = slug.to_string();
+        let processes_map = std::sync::Arc::clone(&self.processes);
+
+        // Spawn background aggregator daemon ticking every 1000ms
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(1000));
+            loop {
+                interval.tick().await;
+                if !processes_map.contains_key(&slug_str) {
+                    break;
+                }
+
+                let mut raw_data = metrics_data_clone.lock().await;
+                if raw_data.is_empty() {
+                    continue;
+                }
+
+                let mut metrics = std::collections::HashMap::new();
+                for (node_id, latencies) in raw_data.drain() {
+                    let count = latencies.len();
+                    if count == 0 {
+                        continue;
+                    }
+                    let sum: u128 = latencies.iter().sum();
+                    let avg_latency_us = (sum / count as u128) as u64;
+
+                    // Calculate P99 percentile latency
+                    let mut sorted = latencies.clone();
+                    sorted.sort_unstable();
+                    let p99_idx = (count * 99 / 100).min(count - 1);
+                    let p99_latency_us = sorted[p99_idx] as u64;
+
+                    metrics.insert(node_id, PerformanceStats {
+                        throughput: count,
+                        avg_latency_us,
+                        p99_latency_us,
+                    });
+                }
+
+                let _ = tx_metrics.send(RunEvent::Metrics { metrics });
+            }
+        });
+
+        let metrics_data_clone_for_stdout = std::sync::Arc::clone(&metrics_data);
         let stdout_task = tokio::spawn(async move {
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                if let Some(payload_str) = line.strip_prefix("__studio_debug__:") {
+                    #[derive(serde::Deserialize)]
+                    struct DebugPayload {
+                        node_id: String,
+                        state: String,
+                        value: String,
+                    }
+                    if let Ok(payload) = serde_json::from_str::<DebugPayload>(payload_str) {
+                        let _ = tx_stdout.send(RunEvent::DebugState {
+                            node_id: payload.node_id,
+                            state: payload.state,
+                            value: payload.value,
+                        });
+                        continue;
+                    }
+                }
+                if let Some(payload_str) = line.strip_prefix("__studio_profile__:") {
+                    #[derive(serde::Deserialize)]
+                    struct ProfilePayload {
+                        node_id: String,
+                        latency_us: u128,
+                    }
+                    if let Ok(payload) = serde_json::from_str::<ProfilePayload>(payload_str) {
+                        let mut data = metrics_data_clone_for_stdout.lock().await;
+                        data.entry(payload.node_id).or_default().push(payload.latency_us);
+                        continue;
+                    }
+                }
                 let _ = tx_stdout.send(RunEvent::Stdout { line });
             }
         });
@@ -223,6 +327,26 @@ impl RunManager {
         });
 
         Ok(())
+    }
+
+    /// Write input data directly to the stdin pipe of the running process for step/resume commands.
+    pub async fn send_stdin(&self, slug: &str, data: &str) -> Result<(), RunError> {
+        if let Some(mut entry) = self.processes.get_mut(slug) {
+            let child = entry.value_mut();
+            if let Some(ref mut stdin) = child.stdin {
+                use tokio::io::AsyncWriteExt;
+                stdin.write_all(data.as_bytes()).await?;
+                stdin.flush().await?;
+                Ok(())
+            } else {
+                Err(RunError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "stdin not piped",
+                )))
+            }
+        } else {
+            Err(RunError::NotRunning(slug.to_string()))
+        }
     }
 
     /// Return the current run status for `slug`.
@@ -326,13 +450,13 @@ edition = "2021"
         let mut rx = manager.subscribe("test");
 
         manager
-            .start_run("test", project_dir.clone())
+            .start_run("test", project_dir.clone(), &[])
             .await
             .expect("start_run succeeds");
 
         // A second start while the first is running must fail.
         let err = manager
-            .start_run("test", project_dir)
+            .start_run("test", project_dir, &[])
             .await
             .expect_err("second start_run should fail");
         assert!(
@@ -411,7 +535,7 @@ edition = "2021"
         let mut rx = manager.subscribe("sleepy");
 
         manager
-            .start_run("sleepy", project_dir)
+            .start_run("sleepy", project_dir, &[])
             .await
             .expect("start_run succeeds");
 
@@ -450,5 +574,90 @@ edition = "2021"
             matches!(err, RunError::NotRunning(ref s) if s == "sleepy"),
             "expected NotRunning, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_start_run_propagates_env_vars_to_child() {
+        // The user-project echoes a custom env var. If `start_run` passes the
+        // env slice through correctly, the value reaches the child and is
+        // visible on stdout.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project_dir = dir.path().join("envproj");
+        tokio::fs::create_dir_all(project_dir.join("src"))
+            .await
+            .expect("create src dir");
+        tokio::fs::write(
+            project_dir.join("Cargo.toml"),
+            r#"[package]
+name = "envproj"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .await
+        .expect("write Cargo.toml");
+        tokio::fs::write(
+            project_dir.join("src/main.rs"),
+            r#"fn main() {
+    println!("STUDIO_PROBE={}", std::env::var("STUDIO_PROBE").unwrap_or_default());
+}
+"#,
+        )
+        .await
+        .expect("write main.rs");
+
+        let manager = RunManager::new();
+        let mut rx = manager.subscribe("envtest");
+        manager
+            .start_run("envtest", project_dir, &[("STUDIO_PROBE", "ok-42")])
+            .await
+            .expect("start_run with env succeeds");
+
+        let mut saw_echo = false;
+        loop {
+            let event = timeout(Duration::from_secs(60), rx.recv())
+                .await
+                .expect("run should finish within 60s")
+                .expect("channel should not close");
+            match event {
+                RunEvent::Stdout { ref line } if line.contains("STUDIO_PROBE=ok-42") => {
+                    saw_echo = true;
+                }
+                RunEvent::Exit { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(saw_echo, "child must see the STUDIO_PROBE env var");
+    }
+
+    #[tokio::test]
+    async fn test_metrics_calculation_averages_and_p99() {
+        // Create sample latencies vector
+        let latencies = vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100]; // 10 items
+        let count = latencies.len();
+        let sum: u128 = latencies.iter().sum();
+        let avg_latency_us = (sum / count as u128) as u64;
+        
+        let mut sorted = latencies.clone();
+        sorted.sort_unstable();
+        let p99_idx = (count * 99 / 100).min(count - 1);
+        let p99_latency_us = sorted[p99_idx] as u64;
+        
+        assert_eq!(avg_latency_us, 55);
+        assert_eq!(p99_latency_us, 100);
+        
+        // Assert for a larger dataset
+        let latencies_100: Vec<u128> = (1..=100).collect(); // 1 to 100
+        let count_100 = latencies_100.len();
+        let sum_100: u128 = latencies_100.iter().sum();
+        let avg_100 = (sum_100 / count_100 as u128) as u64;
+        
+        let mut sorted_100 = latencies_100.clone();
+        sorted_100.sort_unstable();
+        let p99_idx_100 = (count_100 * 99 / 100).min(count_100 - 1);
+        let p99_latency_100 = sorted_100[p99_idx_100] as u64;
+        
+        assert_eq!(avg_100, 50); // 5050 / 100 = 50 (truncated)
+        assert_eq!(p99_latency_100, 100);
     }
 }

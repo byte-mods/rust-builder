@@ -31,6 +31,15 @@ use crate::templates::{
     CodegenMode, DebugBridgeKind, NodeTemplate, TemplateDisplay, TemplateId, TemplateRegistry,
 };
 
+pub mod custom;
+pub mod egress;
+pub mod ingest;
+pub mod language;
+pub mod tokio;
+pub mod connectors;
+pub mod stream;
+pub mod wasm;
+
 /// Register every built-in template into `registry`. Called once at startup
 /// from `TemplateRegistry::with_builtins`. Panics on duplicate id — that's
 /// a builtin-author bug, must surface immediately at startup.
@@ -53,6 +62,59 @@ pub fn register_all(registry: &mut TemplateRegistry) {
     reg!(ParserProtobuf::new());
     reg!(IntegrationConsumerPlaceholder::new());
     reg!(IntegrationSchedulerPlaceholder::new());
+
+    // S10 — real Ingest & Egress adapters
+    reg!(ingest::IntegrationScheduler::new());
+    reg!(ingest::IntegrationFileTail::new());
+    reg!(egress::IntegrationHttpClient::new());
+    reg!(egress::IntegrationDbWriter::new());
+
+    // S15a — visual Rust language nodes.
+    reg!(language::LanguageStruct::new());
+    reg!(language::LanguageEnum::new());
+    reg!(language::LanguageFn::new());
+    reg!(language::LanguageClone::new());
+    reg!(language::LanguageIfElse::new());
+    reg!(language::LanguageMatch::new());
+    reg!(language::LanguageLoop::new());
+    reg!(language::LanguagePropagate::new());
+    reg!(language::LanguageAwait::new());
+    reg!(language::LanguagePointer::new());
+
+    // S15b — Tokio runtime primitives as constructor helpers.
+    reg!(tokio::TokioBroadcast::new());
+    reg!(tokio::TokioMpsc::new());
+    reg!(tokio::TokioMutex::new());
+    reg!(tokio::TokioRwLock::new());
+    reg!(tokio::TokioSpawn::new());
+    reg!(tokio::TokioSleep::new());
+    reg!(tokio::TokioInterval::new());
+    reg!(tokio::TokioSelect::new());
+    reg!(tokio::TokioJoin::new());
+    reg!(tokio::TokioSpawnBlocking::new());
+    reg!(tokio::TokioSemaphore::new());
+    reg!(tokio::TokioNotify::new());
+
+    // S16 — Custom Block visual template
+    reg!(custom::CustomBlock::new());
+
+    // S16/S17 — Universal Connectors
+    reg!(connectors::IntegrationKafkaConsumer::new());
+    reg!(connectors::IntegrationKafkaProducer::new());
+    reg!(connectors::IntegrationRedis::new());
+    reg!(connectors::IntegrationSqlConnector::new());
+
+    // S23-S26 — Streaming Operators (CEP Engine)
+    reg!(stream::StreamFilter::new());
+    reg!(stream::StreamMap::new());
+    reg!(stream::StreamSelect::new());
+    reg!(stream::StreamUnion::new());
+    reg!(stream::StreamJoin::new());
+    reg!(stream::StreamWindow::new());
+    reg!(stream::StreamPattern::new());
+
+    // S27 — WebAssembly runner
+    reg!(wasm::WasmRunner::new());
 }
 
 // ---- shared construction helper -------------------------------------------
@@ -1041,7 +1103,11 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn test_with_builtins_registers_all_eleven() {
+    fn test_with_builtins_registers_expected_inventory() {
+        // Pin-test of the builtin inventory. Adding a template means adding
+        // its id here in sorted order and bumping the len assertion — the
+        // failure surface is intentional so any new registration is a
+        // deliberate, reviewed change.
         let r = TemplateRegistry::with_builtins();
         let ids: Vec<_> = r.summaries().into_iter().map(|s| s.id.as_str().to_string()).collect();
         assert_eq!(
@@ -1050,18 +1116,56 @@ mod tests {
                 "core.dto",
                 "core.entry_point",
                 "core.service",
+                "custom.block",
                 "http.handler",
                 "http.route",
                 "integration.consumer.placeholder",
+                "integration.db_writer",
+                "integration.file_tail",
+                "integration.http_client",
+                "integration.kafka_consumer",
+                "integration.kafka_producer",
+                "integration.redis",
+                "integration.scheduler",
                 "integration.scheduler.placeholder",
+                "integration.sql_connector",
+                "language.await",
+                "language.clone",
+                "language.enum",
+                "language.fn",
+                "language.if_else",
+                "language.loop",
+                "language.match",
+                "language.pointer",
+                "language.propagate",
+                "language.struct",
                 "observability.logger",
                 "parser.json",
                 "parser.protobuf",
                 "parser.xml",
+                "stream.filter",
+                "stream.join",
+                "stream.map",
+                "stream.pattern",
+                "stream.select",
+                "stream.union",
+                "stream.window",
+                "tokio.broadcast",
+                "tokio.interval",
+                "tokio.join",
+                "tokio.mpsc",
+                "tokio.mutex",
+                "tokio.notify",
+                "tokio.rwlock",
+                "tokio.select",
+                "tokio.semaphore",
+                "tokio.sleep",
+                "tokio.spawn",
+                "tokio.spawn_blocking",
             ],
             "expected exact set of builtin ids (sorted lexicographically by summaries())"
         );
-        assert_eq!(r.len(), 11);
+        assert_eq!(r.len(), 49);
     }
 
     #[test]

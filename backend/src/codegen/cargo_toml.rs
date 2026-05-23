@@ -31,7 +31,7 @@ type DepMap = BTreeMap<String, String>;
 /// achievable in generated code without per-template plumbing.
 pub fn baseline_dependencies() -> DepMap {
     let mut m = BTreeMap::new();
-    m.insert("tokio".into(), r#"{ version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }"#.into());
+    m.insert("tokio".into(), r#"{ version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "fs", "io-util"] }"#.into());
     m.insert("axum".into(), "\"0.7\"".into());
     m.insert("serde".into(), r#"{ version = "1", features = ["derive"] }"#.into());
     m.insert("serde_json".into(), "\"1\"".into());

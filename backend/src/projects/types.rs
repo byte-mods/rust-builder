@@ -267,6 +267,9 @@ pub struct Node {
     /// Optional user-friendly label; UI falls back to `id` / template name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Optional developer note/comment for this node in the visual builder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
 }
 
 // Backward-compatible Deserialize — accepts both the S2 legacy shape (with
@@ -301,6 +304,9 @@ impl<'de> Deserialize<'de> for Node {
         let label: Option<String> = obj
             .get("label")
             .and_then(|v| v.as_str().map(|s| s.to_string()));
+        let comment: Option<String> = obj
+            .get("comment")
+            .and_then(|v| v.as_str().map(|s| s.to_string()));
 
         // Resolve template_id with backward compatibility:
         //   - If `template_id` is present, deserialise through TemplateId's
@@ -333,6 +339,7 @@ impl<'de> Deserialize<'de> for Node {
             position,
             config,
             label,
+            comment,
         })
     }
 }

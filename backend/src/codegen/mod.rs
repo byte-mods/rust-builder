@@ -42,10 +42,14 @@
 //!   generator just produces files; building them is somebody else's job.
 
 pub mod bootstrap;
+pub mod cache;
 pub mod cargo_toml;
+pub mod dataflow;
 pub mod files;
 pub mod format;
 pub mod regions;
+
+pub use cache::{CodegenCache, RegenOutcome};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -168,6 +172,7 @@ impl Generator {
 
         let mut report = GenerateReport::default();
         let mut all_deps: Vec<(String, String)> = Vec::new();
+        let dataflow = dataflow::DataflowGraph::analyze(graph, &self.registry);
 
         // Track module files per directory for mod.rs + lib.rs generation.
         let mut dir_mods: std::collections::BTreeMap<String, Vec<String>> =
@@ -185,6 +190,17 @@ impl Generator {
         let errors_path = src_dir.join("errors.rs");
         if files::write_atomic_if_changed(&errors_path, &errors_src).await? {
             report.files_written.push("src/errors.rs".to_string());
+        }
+
+        // --- 0b. Bootstrap debug.rs (S13) -----------------------------------------
+        let debug_src = format::validate_and_format(
+            &bootstrap::debug_rs(),
+            "bootstrap",
+            "debug",
+        )?;
+        let debug_path = src_dir.join("debug.rs");
+        if files::write_atomic_if_changed(&debug_path, &debug_src).await? {
+            report.files_written.push("src/debug.rs".to_string());
         }
 
         // --- 1. Per-node runtime emissions ----------------------------------------
@@ -210,8 +226,31 @@ impl Generator {
                     report.pending_templates.push(template_id.as_str().to_string());
                 } else {
                     for item in &emission.items {
+                        if item.source.contains(".unwrap()") || item.source.contains(".expect(") || item.source.contains("panic!") {
+                            return Err(CodegenError::InvalidEmission {
+                                template_id: template_id.as_str().to_string(),
+                                node_id: node.id.0.clone(),
+                                error: "templates are forbidden from emitting unwrap(), expect(), or panic! — use ? propagation or explicit error handling instead".to_string(),
+                            });
+                        }
+                        let replaced_src = dataflow::replace_placeholders(&item.source, &dataflow);
+                        let debug_kind = template.debug_bridge();
+                        let final_src = if debug_kind != crate::templates::DebugBridgeKind::PassThrough {
+                            match instrument_source(&replaced_src, &node.id.0, template_id.as_str()) {
+                                Ok(src) => src,
+                                Err(e) => {
+                                    return Err(CodegenError::InvalidEmission {
+                                        template_id: template_id.as_str().to_string(),
+                                        node_id: node.id.0.clone(),
+                                        error: format!("debug instrumentation failed: {e}"),
+                                    });
+                                }
+                            }
+                        } else {
+                            replaced_src
+                        };
                         let formatted = format::validate_and_format(
-                            &item.source,
+                            &final_src,
                             template_id.as_str(),
                             &node.id.0,
                         )?;
@@ -229,7 +268,8 @@ impl Generator {
                         for item in &emission.items {
                             if let Some((dir, file)) = item.module_path.rsplit_once('/') {
                                 let name = file.trim_end_matches(".rs");
-                                let expr = format!("crate::{}::{}::run()", dir.replace('/', "::"), name);
+                                let crate_name = slug.as_str().replace('-', "_");
+                                let expr = format!("{}::{}::{}::run()", crate_name, dir.replace('/', "::"), name);
                                 spawn_tasks.push((name.to_string(), expr));
                             }
                         }
@@ -243,8 +283,16 @@ impl Generator {
                 let schema_emission = template.emit_schema(&ctx)?;
                 if !schema_emission.is_placeholder() {
                     for item in &schema_emission.items {
+                        if item.source.contains(".unwrap()") || item.source.contains(".expect(") || item.source.contains("panic!") {
+                            return Err(CodegenError::InvalidEmission {
+                                template_id: template_id.as_str().to_string(),
+                                node_id: node.id.0.clone(),
+                                error: "templates are forbidden from emitting unwrap(), expect(), or panic! — use ? propagation or explicit error handling instead".to_string(),
+                            });
+                        }
+                        let replaced_src = dataflow::replace_placeholders(&item.source, &dataflow);
                         let formatted = format::validate_and_format(
-                            &item.source,
+                            &replaced_src,
                             template_id.as_str(),
                             &node.id.0,
                         )?;
@@ -280,9 +328,10 @@ impl Generator {
         let mut lib_regions = std::collections::HashMap::new();
 
         let mut module_decls = String::new();
-        module_decls.push_str("mod errors;\n");
+        module_decls.push_str("pub mod errors;\n");
+        module_decls.push_str("pub mod debug;\n");
         for dir in dir_mods.keys() {
-            module_decls.push_str(&format!("mod {};\n", dir));
+            module_decls.push_str(&format!("pub mod {};\n", dir));
         }
         lib_regions.insert("module_decls".to_string(), module_decls);
 
@@ -321,7 +370,7 @@ impl Generator {
                     };
 
                     routes.push_str(&format!(
-                        "    .route(\"{}\", axum::routing::{}(handlers::{}::{}))\n",
+                        "    r = r.route(\"{}\", axum::routing::{}(handlers::{}::{}));\n",
                         route_cfg.path, method_fn, handler_cfg.name, handler_cfg.name
                     ));
                 }
@@ -378,6 +427,13 @@ impl Generator {
         }
         report.dependencies = all_deps;
 
+        // --- 6. CLAUDE.md ---------------------------------------------------------
+        let claude_src = bootstrap::claude_md(slug);
+        let claude_path = project_dir.join("CLAUDE.md");
+        if files::write_atomic_if_changed(&claude_path, &claude_src).await? {
+            report.files_written.push("CLAUDE.md".to_string());
+        }
+
         report.files_written.sort();
         report.files_written.dedup();
         report.pending_templates.sort();
@@ -387,10 +443,100 @@ impl Generator {
     }
 }
 
+/// Parse, traverse, and wrap functions inside generated source files with visual debugger hooks.
+fn instrument_source(
+    source: &str,
+    node_id: &str,
+    template_id: &str,
+) -> Result<String, ::syn::Error> {
+    let mut file: ::syn::File = ::syn::parse_file(source)?;
+    let mut changed = false;
+
+    for item in &mut file.items {
+        if let ::syn::Item::Fn(item_fn) = item {
+            // Collect inputs to the function
+            let mut arg_idents = Vec::new();
+            for input in &item_fn.sig.inputs {
+                if let ::syn::FnArg::Typed(pat_type) = input {
+                    if let ::syn::Pat::Ident(pat_ident) = &*pat_type.pat {
+                        arg_idents.push(pat_ident.ident.clone());
+                    }
+                }
+            }
+
+            let inputs_expr: ::syn::Expr = if arg_idents.is_empty() {
+                ::syn::parse_quote!(())
+            } else if arg_idents.len() == 1 {
+                let first = &arg_idents[0];
+                ::syn::parse_quote!(&#first)
+            } else {
+                ::syn::parse_quote!((#(&#arg_idents),*))
+            };
+
+            let stmts = &item_fn.block.stmts;
+            let node_id_str = node_id.to_string();
+
+            let new_block: ::syn::Block = if item_fn.sig.asyncness.is_some() {
+                let after_hook: ::syn::Stmt = if template_id == "http.handler" {
+                    ::syn::parse_quote! {
+                        let debug_res = match &result {
+                            Ok(_) => Ok("IntoResponse"),
+                            Err(e) => Err(e),
+                        };
+                    }
+                } else {
+                    ::syn::parse_quote! {
+                        let debug_res = &result;
+                    }
+                };
+                
+                let after_call: ::syn::Stmt = if template_id == "http.handler" {
+                    ::syn::parse_quote! {
+                        crate::debug::bridge_after(#node_id_str, &debug_res);
+                    }
+                } else {
+                    ::syn::parse_quote! {
+                        crate::debug::bridge_after(#node_id_str, debug_res);
+                    }
+                };
+
+                ::syn::parse_quote!({
+                    crate::debug::bridge_before(#node_id_str, &#inputs_expr);
+                    let result = (|| async {
+                        #(#stmts)*
+                    })().await;
+                    #after_hook
+                    #after_call
+                    result
+                })
+            } else {
+                ::syn::parse_quote!({
+                    crate::debug::bridge_before(#node_id_str, &#inputs_expr);
+                    let result = (|| {
+                        #(#stmts)*
+                    })();
+                    crate::debug::bridge_after(#node_id_str, &result);
+                    result
+                })
+            };
+
+            item_fn.block = Box::new(new_block);
+            changed = true;
+        }
+    }
+
+    if changed {
+        Ok(::prettyplease::unparse(&file))
+    } else {
+        Ok(source.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    use crate::templates::{NodeTemplate, TemplateId, TemplateDisplay, PortSpec};
 
     #[tokio::test]
     async fn test_generate_project_creates_src_dir() {
@@ -535,9 +681,9 @@ mod tests {
         let main_src = tokio::fs::read_to_string(dir.path().join("lr/src/main.rs")).await.unwrap();
         assert!(main_src.contains("async fn supervise"), "main.rs must contain supervise");
         assert!(main_src.contains("tokio::spawn(supervise(\"orders_consumer\""));
-        assert!(main_src.contains("crate::consumers::orders_consumer::run()"));
+        assert!(main_src.contains("lr::consumers::orders_consumer::run()"), "main_src did not contain expected orders consumer, content:\n{}", main_src);
         assert!(main_src.contains("tokio::spawn(supervise(\"morning\""));
-        assert!(main_src.contains("crate::schedulers::morning::run()"));
+        assert!(main_src.contains("lr::schedulers::morning::run()"), "main_src did not contain expected morning run, content:\n{}", main_src);
 
         let lib_src = tokio::fs::read_to_string(dir.path().join("lr/src/lib.rs")).await.unwrap();
         assert!(lib_src.contains("mod consumers;"), "lib.rs must declare consumers: {lib_src}");
@@ -649,6 +795,68 @@ mod tests {
         };
         let api: ApiError = err.into();
         assert!(matches!(api, ApiError::Internal(_)));
+    }
+
+    #[tokio::test]
+    async fn test_generate_project_rejects_unwrap_or_expect() {
+        let dir = tempdir().unwrap();
+        
+        struct PanicTemplate;
+        impl NodeTemplate for PanicTemplate {
+            fn id(&self) -> &TemplateId {
+                static ID: std::sync::OnceLock<TemplateId> = std::sync::OnceLock::new();
+                ID.get_or_init(|| TemplateId::new("test.panic").unwrap())
+            }
+            fn display(&self) -> &TemplateDisplay {
+                static DISPLAY: std::sync::OnceLock<TemplateDisplay> = std::sync::OnceLock::new();
+                DISPLAY.get_or_init(|| TemplateDisplay::new("Panic", "test", "panic template"))
+            }
+            fn input_ports(&self) -> &[PortSpec] { &[] }
+            fn output_ports(&self) -> &[PortSpec] { &[] }
+            fn config_schema(&self) -> &serde_json::Value {
+                static SCHEMA: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+                SCHEMA.get_or_init(|| serde_json::json!({"type": "object"}))
+            }
+            fn emit_runtime(
+                &self,
+                _ctx: &crate::templates::codegen::CodegenCtx<'_>,
+            ) -> Result<crate::templates::codegen::RuntimeEmission, crate::templates::TemplateError> {
+                Ok(crate::templates::codegen::RuntimeEmission {
+                    items: vec![crate::templates::codegen::EmittedItem {
+                        module_path: "panic.rs".to_string(),
+                        source: "pub fn do_panic() { let x: Option<i32> = None; x.unwrap(); }".to_string(),
+                    }],
+                    dependencies: vec![],
+                    debug_site: None,
+                })
+            }
+        }
+
+        let mut registry = TemplateRegistry::new();
+        registry.insert(Arc::new(PanicTemplate));
+        let gen = Generator::new(Arc::new(registry), dir.path().to_path_buf());
+        let slug = Slug::new("unwrap-test").unwrap();
+        tokio::fs::create_dir(dir.path().join("unwrap-test")).await.unwrap();
+
+        let graph = Graph {
+            schema_version: crate::projects::types::GRAPH_SCHEMA_VERSION,
+            nodes: vec![
+                crate::projects::types::Node {
+                    id: crate::projects::types::NodeId("n1".into()),
+                    template_id: TemplateId::new("test.panic").unwrap(),
+                    position: crate::projects::types::Position { x: 0.0, y: 0.0 },
+                    config: serde_json::json!({}),
+                    label: None,
+                },
+            ],
+            edges: vec![],
+        };
+
+        let err = gen.generate_project(&slug, &graph).await.unwrap_err();
+        assert!(
+            err.to_string().contains("forbidden from emitting unwrap()"),
+            "expected unwrap rejection error, got: {err}"
+        );
     }
 
     #[tokio::test]

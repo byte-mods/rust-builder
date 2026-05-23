@@ -1,14 +1,32 @@
 import { useCallback } from "react";
+import MonacoEditor, { type EditorMarker } from "../components/MonacoEditor";
+import { type ParsedDiagnostic } from "../api";
+
+const CODE_FIELDS: Record<string, { height: string; language: string }> = {
+  body: { height: "220px", language: "rust" },
+  condition: { height: "90px", language: "rust" },
+  true_expr: { height: "110px", language: "rust" },
+  false_expr: { height: "110px", language: "rust" },
+  expr: { height: "110px", language: "rust" },
+  where_clause: { height: "100px", language: "rust" },
+  code: { height: "380px", language: "rust" },
+};
 
 interface SchemaFormProps {
   schema: unknown;
   value: unknown;
+  diagnostics?: ParsedDiagnostic[];
   onChange: (value: unknown) => void;
 }
 
 /// Best-effort dynamic form renderer from a JSON Schema object.
 /// Handles the shapes produced by schemars for the seven built-in templates.
-export default function SchemaForm({ schema, value, onChange }: SchemaFormProps): JSX.Element {
+export default function SchemaForm({
+  schema,
+  value,
+  diagnostics = [],
+  onChange,
+}: SchemaFormProps): JSX.Element {
   const objValue = (typeof value === "object" && value !== null ? value : {}) as Record<string, unknown>;
 
   const setField = useCallback(
@@ -32,16 +50,19 @@ export default function SchemaForm({ schema, value, onChange }: SchemaFormProps)
 
   return (
     <div className="schema-form">
-      {Object.entries(properties).map(([key, propSchema]) => (
-        <SchemaField
-          key={key}
-          name={key}
-          schema={propSchema}
-          value={objValue[key]}
-          required={required.has(key)}
-          onChange={(v) => setField(key, v)}
-        />
-      ))}
+      {Object.entries(properties)
+        .filter(([key]) => key !== "inputs" && key !== "outputs")
+        .map(([key, propSchema]) => (
+          <SchemaField
+            key={key}
+            name={key}
+            schema={propSchema}
+            value={objValue[key]}
+            required={required.has(key)}
+            diagnostics={diagnostics}
+            onChange={(v) => setField(key, v)}
+          />
+        ))}
     </div>
   );
 }
@@ -51,10 +72,18 @@ interface SchemaFieldProps {
   schema: unknown;
   value: unknown;
   required: boolean;
+  diagnostics?: ParsedDiagnostic[];
   onChange: (value: unknown) => void;
 }
 
-function SchemaField({ name, schema, value, required, onChange }: SchemaFieldProps): JSX.Element {
+function SchemaField({
+  name,
+  schema,
+  value,
+  required,
+  diagnostics = [],
+  onChange,
+}: SchemaFieldProps): JSX.Element {
   if (typeof schema !== "object" || schema === null) {
     return (
       <label>
@@ -123,7 +152,36 @@ function SchemaField({ name, schema, value, required, onChange }: SchemaFieldPro
       );
 
     case "string":
-    default:
+    default: {
+      if (name in CODE_FIELDS) {
+        const spec = CODE_FIELDS[name];
+
+        // Map compiler line errors to Monaco Editor markers with line-offset rules
+        const markers: EditorMarker[] = diagnostics.map((d) => {
+          const startLine = name === "body" ? Math.max(1, d.line - 2) : 1;
+          return {
+            startLineNumber: startLine,
+            startColumn: d.column,
+            endLineNumber: startLine,
+            endColumn: d.column + 5,
+            message: d.message,
+            severity: d.severity === "warning" ? "warning" : "error",
+          };
+        });
+
+        return (
+          <label>
+            {name}{required && <span className="required">*</span>}
+            <MonacoEditor
+              value={typeof value === "string" ? value : ""}
+              onChange={onChange}
+              height={spec.height}
+              language={spec.language}
+              markers={markers}
+            />
+          </label>
+        );
+      }
       return (
         <label>
           {name}{required && <span className="required">*</span>}
@@ -134,6 +192,7 @@ function SchemaField({ name, schema, value, required, onChange }: SchemaFieldPro
           />
         </label>
       );
+    }
   }
 }
 

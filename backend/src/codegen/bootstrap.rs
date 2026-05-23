@@ -94,6 +94,8 @@ async fn main() {{
         )
         .init();
 
+    {crate_name}::debug::init_debug();
+
     let addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
@@ -159,6 +161,114 @@ impl IntoResponse for AppError {
     .to_string()
 }
 
+/// Generate the `debug.rs` debugger bridge scaffold.
+pub fn debug_rs() -> String {
+    r#"//! Synchronous Step-Debugger & Performance Profiling Bridge (S13 & S21).
+//!
+//! Handles visual breakpoints, interactive play/pause/step triggers,
+//! edge payload logging, and dynamic latency/throughput profiling.
+
+use std::sync::{Mutex, OnceLock};
+use std::collections::HashMap;
+use std::time::Instant;
+
+/// Global thread-safe map to track visual node entry times.
+fn start_times() -> &'static Mutex<HashMap<String, Instant>> {
+    static LOCK: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Initialize the debugger. No-op since we read stdin synchronously.
+pub fn init_debug() {}
+
+/// Helper to check if a breakpoint is configured on a node.
+fn is_breakpoint(node_id: &str) -> bool {
+    if let Ok(bps) = std::env::var("STUDIO_BREAKPOINTS") {
+        bps.split(',').any(|s| s.trim() == node_id)
+    } else {
+        false
+    }
+}
+
+/// Helper to check if global step-mode is active.
+fn is_step_mode() -> bool {
+    std::env::var("STUDIO_STEP_MODE").as_deref() == Ok("1")
+}
+
+/// Hook called BEFORE a visual node executes its core body.
+pub fn bridge_before(node_id: &'static str, val: &dyn std::fmt::Debug) {
+    // S21: Low-overhead profile gating
+    if std::env::var("STUDIO_DEBUG").is_err() && std::env::var("STUDIO_PROFILE").is_err() {
+        return;
+    }
+
+    // Capture entry time
+    let now = Instant::now();
+    if let Ok(mut lock) = start_times().lock() {
+        lock.insert(node_id.to_string(), now);
+    }
+
+    // S13: Visual debugger suspension (only executes if STUDIO_DEBUG is active)
+    if std::env::var("STUDIO_DEBUG").is_ok() {
+        let formatted_val = format!("{:?}", val);
+        
+        // Broadcast variables for dynamic visual edge hovers
+        println!("__studio_debug__:{{\"node_id\": \"{}\", \"state\": \"before\", \"value\": {:?}}}", node_id, formatted_val);
+
+        let bp = is_breakpoint(node_id);
+        let step = is_step_mode();
+
+        if bp || step {
+            // Broadcast that we have suspended execution
+            println!("__studio_debug__:{{\"node_id\": \"{}\", \"state\": \"paused\", \"value\": {:?}}}", node_id, formatted_val);
+
+            // Read command synchronously from stdin (blocks execution thread until studio backend sends newline command)
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if std::io::stdin().read_line(&mut line).is_ok() {
+                    let cmd = line.trim();
+                    if cmd == "resume" || cmd == "step" {
+                        if cmd == "step" {
+                            std::env::set_var("STUDIO_STEP_MODE", "1");
+                        } else {
+                            std::env::set_var("STUDIO_STEP_MODE", "0");
+                        }
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Hook called AFTER a visual node executes its core body.
+pub fn bridge_after(node_id: &'static str, val: &dyn std::fmt::Debug) {
+    if std::env::var("STUDIO_DEBUG").is_err() && std::env::var("STUDIO_PROFILE").is_err() {
+        return;
+    }
+
+    // S21: Compute execution latency in microseconds and emit standard print
+    if let Ok(mut lock) = start_times().lock() {
+        if let Some(start) = lock.remove(node_id) {
+            let elapsed = start.elapsed().as_micros();
+            println!("__studio_profile__:{{\"node_id\": \"{}\", \"latency_us\": {}}}", node_id, elapsed);
+        }
+    }
+
+    // S13: Emits dynamic debug state after execution completes
+    if std::env::var("STUDIO_DEBUG").is_ok() {
+        let formatted_val = format!("{:?}", val);
+        println!("__studio_debug__:{{\"node_id\": \"{}\", \"state\": \"after\", \"value\": {:?}}}", node_id, formatted_val);
+    }
+}
+"#
+    .to_string()
+}
+
+
 /// Generate the `lib.rs` scaffold. The empty `@generated:begin routes`
 /// region is the splice point T7's `http.route` template targets.
 pub fn lib_rs(_slug: &Slug) -> String {
@@ -177,7 +287,7 @@ pub fn lib_rs(_slug: &Slug) -> String {
 /// middleware outside the `@generated:routes` region and your edits will
 /// survive regen.
 pub fn router() -> axum::Router {
-    let r = axum::Router::new();
+    let mut r = axum::Router::new();
     // @generated:begin routes
     // (Filled by codegen — `.route(...)` calls live here.)
     // @generated:end routes
@@ -187,12 +297,56 @@ pub fn router() -> axum::Router {
     .to_string()
 }
 
+/// Generate the project contract `CLAUDE.md` for a user-project.
+///
+/// Kept in sync with the studio's offline pair-programming guidelines so
+/// that LLMs/agents working on this generated project know how to compile,
+/// test, and follow architectural boundaries.
+pub fn claude_md(slug: &crate::projects::types::Slug) -> String {
+    let crate_name = slug.as_str().replace('-', "_");
+    let mut s = String::new();
+    s.push_str("# ");
+    s.push_str(&crate_name);
+    s.push_str(" - Visual Rust Project Contract\n\n");
+    s.push_str("This generated project is managed by 'rust_no_code' studio. You can edit this project directly, but please respect the boundaries between generated and user-editable code.\n\n");
+    s.push_str("## Build and Test Commands\n");
+    s.push_str("- Check code: 'cargo check'\n");
+    s.push_str("- Build release: 'cargo build --release'\n");
+    s.push_str("- Run tests: 'cargo test'\n");
+    s.push_str("- Run project: 'cargo run' (or set 'BIND_ADDR=127.0.0.1:8080 cargo run')\n\n");
+    s.push_str("## Project Conventions & Structure\n");
+    s.push_str("- Fully generated files: These are completely overwritten on regeneration. Do not edit them directly as your changes will be lost on the next canvas save/check:\n");
+    s.push_str("  - 'Cargo.toml' (managed dependencies)\n");
+    s.push_str("  - 'src/main.rs' (supervised runners and axum listener)\n");
+    s.push_str("  - 'src/types/*.rs' (generated struct/enum models)\n");
+    s.push_str("  - 'src/functions/*.rs' (generated async functions)\n");
+    s.push_str("  - 'src/schedulers/*.rs' (cron schedulers)\n");
+    s.push_str("  - 'src/consumers/*.rs' (file tails, queues)\n");
+    s.push_str("  - 'src/integrations/*.rs' (HTTP clients, SQLite writers)\n");
+    s.push_str("- User-editable files / regions:\n");
+    s.push_str("  - 'src/lib.rs': Spliced routes are inside '// @generated:begin routes' and '// @generated:end routes'. You can add custom middleware, Axum layers, or custom modules outside this region!\n");
+    s.push_str("  - 'src/errors.rs': Customize application-level errors.\n\n");
+    s.push_str("## Coding Guidelines\n");
+    s.push_str("- Async First: All handlers, services, and integrations use 'async/await'.\n");
+    s.push_str("- Error Handling: Prefer propagating errors via Axum-compatible 'Result<T, AppError>' and the '?' operator. Avoid 'unwrap()', 'expect()', or 'panic!' unless absolutely unrecoverable.\n");
+    s.push_str("- Tokio Runtime: Leverage tokio primitives (like MPSC, Broadcast, Sleep, Spawn) inside your custom nodes.\n");
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn slug(s: &str) -> Slug {
         Slug::new(s).unwrap()
+    }
+
+    #[test]
+    fn test_claude_md_renders_correctly() {
+        let src = claude_md(&slug("user-service"));
+        assert!(src.contains("# user_service - Visual Rust Project Contract"), "found:\n{src}");
+        assert!(src.contains("cargo check"));
+        assert!(src.contains("cargo test"));
     }
 
     #[test]

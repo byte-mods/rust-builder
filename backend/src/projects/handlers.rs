@@ -18,9 +18,11 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::build::BuildVerb;
 use crate::codegen::{GenerateReport, Generator};
 use crate::error::ApiError;
 use crate::projects::{Graph, Project, ProjectMeta, Slug};
+use crate::projects::llm;
 use crate::AppState;
 use std::sync::Arc;
 
@@ -42,6 +44,12 @@ pub fn projects_router() -> Router<AppState> {
         .route("/projects/:slug/run", post(run_project))
         .route("/projects/:slug/stop", post(stop_project))
         .route("/projects/:slug/status", get(run_status))
+        .route("/projects/:slug/test", post(test_project))
+        .route("/projects/:slug/debug", post(debug_project))
+        .route("/projects/:slug/debug/action", post(debug_action))
+        .route("/projects/:slug/llm/generate-flow", post(generate_flow))
+        .route("/projects/:slug/llm/refine-flow", post(refine_flow))
+        .route("/projects/:slug/audit", post(audit_project))
 }
 
 /// Request body for `POST /api/projects`. `slug` deserialises through the
@@ -108,6 +116,10 @@ async fn delete_project(
 ) -> Result<StatusCode, ApiError> {
     let slug = parse_slug(&slug)?;
     state.store.delete(&slug).await?;
+    // Drop the codegen hash cache entry so a recreate with the same slug
+    // does not falsely skip its first regen on a hash match against the
+    // previous project's last-built graph.
+    state.codegen_cache.forget(&slug);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -132,7 +144,28 @@ async fn put_graph(
     graph: Result<Json<Graph>, JsonRejection>,
 ) -> Result<Json<Graph>, ApiError> {
     let slug = parse_slug(&slug)?;
-    let Json(graph) = graph?;
+    let Json(mut graph) = graph?;
+
+    for node in &mut graph.nodes {
+        if node.template_id.as_str() == "custom.block" {
+            if let Some(code_val) = node.config.get("code") {
+                if let Some(code_str) = code_val.as_str() {
+                    match crate::templates::builtins::custom::parse_signature(code_str) {
+                        Ok((inputs, outputs)) => {
+                            if let serde_json::Value::Object(ref mut map) = node.config {
+                                map.insert("inputs".to_string(), serde_json::to_value(inputs).unwrap());
+                                map.insert("outputs".to_string(), serde_json::to_value(outputs).unwrap());
+                            }
+                        }
+                        Err(e) => {
+                            return Err(ApiError::InvalidGraph(format!("Custom block '{}' code parsing failed: {}", node.id.0, e)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     state.store.save_graph(&slug, &graph, &state.registry).await?;
     Ok(Json(graph))
 }
@@ -173,10 +206,24 @@ async fn build_project(
     // Verify the project exists before spawning cargo — consistent with
     // every other project-scoped endpoint.
     let _ = state.store.load(&slug).await?;
+
+    // S16: Regen first if the graph has changed since the last build
+    let graph = state.store.load_graph(&slug).await?;
+    let generator = Generator::new(
+        Arc::clone(&state.registry),
+        state.store.root().to_path_buf(),
+    );
+    let _ = state.codegen_cache.regen_if_changed(&generator, &slug, &graph).await?;
+
     let project_dir = state.store.root().join(slug.as_str());
+    let verb = if query.release {
+        BuildVerb::BuildRelease
+    } else {
+        BuildVerb::Check
+    };
     state
         .build_manager
-        .start_build(slug.as_str(), project_dir, query.release)
+        .start_build(slug.as_str(), project_dir, verb, Some(graph))
         .await
         .map_err(|e| match e {
             crate::build::BuildError::AlreadyRunning(_) => ApiError::BuildInProgress,
@@ -193,10 +240,93 @@ async fn run_project(
 ) -> Result<StatusCode, ApiError> {
     let slug = parse_slug(&slug)?;
     let _ = state.store.load(&slug).await?;
+
+    // S16: Regen first if the graph has changed since the last run
+    let graph = state.store.load_graph(&slug).await?;
+    let generator = Generator::new(
+        Arc::clone(&state.registry),
+        state.store.root().to_path_buf(),
+    );
+    let _ = state.codegen_cache.regen_if_changed(&generator, &slug, &graph).await?;
+
     let project_dir = state.store.root().join(slug.as_str());
     state
         .run_manager
-        .start_run(slug.as_str(), project_dir)
+        .start_run(slug.as_str(), project_dir, &[("STUDIO_PROFILE", "1")])
+        .await?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// `POST /api/projects/:slug/test` — start `cargo test` for the user-project.
+/// Returns 202 immediately; output is streamed via the build WebSocket endpoint.
+async fn test_project(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let slug = parse_slug(&slug)?;
+    let _ = state.store.load(&slug).await?;
+
+    // S16: Regen first if the graph has changed since the last test
+    let graph = state.store.load_graph(&slug).await?;
+    let generator = Generator::new(
+        Arc::clone(&state.registry),
+        state.store.root().to_path_buf(),
+    );
+    let _ = state.codegen_cache.regen_if_changed(&generator, &slug, &graph).await?;
+
+    let project_dir = state.store.root().join(slug.as_str());
+    state
+        .build_manager
+        .start_build(slug.as_str(), project_dir, BuildVerb::Test, Some(graph))
+        .await
+        .map_err(|e| match e {
+            crate::build::BuildError::AlreadyRunning(_) => ApiError::BuildInProgress,
+            crate::build::BuildError::Io(io) => io.into(),
+        })?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+#[derive(Debug, Deserialize)]
+struct StartDebugBody {
+    breakpoints: Option<Vec<String>>,
+}
+
+/// `POST /api/projects/:slug/debug` — start `cargo run` with debug env vars for the user-project.
+/// Returns 202 immediately; output is streamed via the run WebSocket endpoint.
+async fn debug_project(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+    body: Option<Json<StartDebugBody>>,
+) -> Result<StatusCode, ApiError> {
+    let slug = parse_slug(&slug)?;
+    let _ = state.store.load(&slug).await?;
+
+    // S16: Regen first if the graph has changed since the last debug run
+    let graph = state.store.load_graph(&slug).await?;
+    let generator = Generator::new(
+        Arc::clone(&state.registry),
+        state.store.root().to_path_buf(),
+    );
+    let _ = state.codegen_cache.regen_if_changed(&generator, &slug, &graph).await?;
+
+    let bps_str = body
+        .and_then(|Json(b)| b.breakpoints)
+        .map(|bps| bps.join(","))
+        .unwrap_or_default();
+
+    let project_dir = state.store.root().join(slug.as_str());
+    state
+        .run_manager
+        .start_run(
+            slug.as_str(),
+            project_dir,
+            &[
+                ("RUST_LOG", "debug"),
+                ("RUST_BACKTRACE", "full"),
+                ("STUDIO_DEBUG", "1"),
+                ("STUDIO_BREAKPOINTS", &bps_str),
+            ],
+        )
         .await?;
     Ok(StatusCode::ACCEPTED)
 }
@@ -210,6 +340,31 @@ async fn stop_project(
     let slug = parse_slug(&slug)?;
     state.run_manager.stop_run(slug.as_str()).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+struct DebugActionBody {
+    action: String,
+}
+
+/// `POST /api/projects/:slug/debug/action` — send resume or step commands to the running debug process.
+async fn debug_action(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+    Json(body): Json<DebugActionBody>,
+) -> Result<StatusCode, ApiError> {
+    let slug = parse_slug(&slug)?;
+    let command = match body.action.as_str() {
+        "resume" => "resume\n",
+        "step" => "step\n",
+        other => {
+            return Err(ApiError::InvalidBody(format!(
+                "invalid debug action `{other}` (must be `resume` or `step`)"
+            )));
+        }
+    };
+    state.run_manager.send_stdin(slug.as_str(), command).await?;
+    Ok(StatusCode::OK)
 }
 
 /// `GET /api/projects/:slug/status` — return the current run status.
@@ -227,3 +382,99 @@ async fn run_status(
 fn parse_slug(raw: &str) -> Result<Slug, ApiError> {
     Slug::new(raw).map_err(|e| ApiError::InvalidSlug(e.to_string()))
 }
+
+#[derive(Debug, Deserialize)]
+struct GenerateFlowBody {
+    prompt: String,
+    history: Option<Vec<llm::ChatMessage>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RefineFlowBody {
+    prompt: String,
+    history: Option<Vec<llm::ChatMessage>>,
+}
+
+/// `POST /api/projects/:slug/llm/generate-flow` — generate a proposed flow graph using Anthropic Claude.
+async fn generate_flow(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+    body: Result<Json<GenerateFlowBody>, JsonRejection>,
+) -> Result<Json<Graph>, ApiError> {
+    let slug = parse_slug(&slug)?;
+    let _ = state.store.load(&slug).await?;
+    let Json(body) = body?;
+
+    let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| ApiError::ApiKeyMissing)?;
+    if api_key.trim().is_empty() {
+        return Err(ApiError::ApiKeyMissing);
+    }
+
+    let project_dir = state.store.root().join(slug.as_str());
+    let current_graph = state.store.load_graph(&slug).await?;
+
+    let context = llm::assemble_context(&project_dir, &current_graph);
+    let system_prompt = llm::build_system_prompt(&state.registry);
+    
+    let user_prompt = format!(
+        "The developer wants to completely generate or heavily modify the flow graph.\n\n### Project Context:\n{}\n\n### Developer's Request:\n{}",
+        context, body.prompt
+    );
+
+    let history_ref = body.history.as_deref();
+    let proposed_graph = llm::call_anthropic_api(&api_key, &system_prompt, &user_prompt, history_ref).await?;
+    llm::validate_proposed_graph(&proposed_graph, &state.registry)?;
+
+    Ok(Json(proposed_graph))
+}
+
+/// `POST /api/projects/:slug/llm/refine-flow` — refine the existing flow graph using Anthropic Claude.
+async fn refine_flow(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+    body: Result<Json<RefineFlowBody>, JsonRejection>,
+) -> Result<Json<Graph>, ApiError> {
+    let slug = parse_slug(&slug)?;
+    let _ = state.store.load(&slug).await?;
+    let Json(body) = body?;
+
+    let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| ApiError::ApiKeyMissing)?;
+    if api_key.trim().is_empty() {
+        return Err(ApiError::ApiKeyMissing);
+    }
+
+    let project_dir = state.store.root().join(slug.as_str());
+    let current_graph = state.store.load_graph(&slug).await?;
+
+    let context = llm::assemble_context(&project_dir, &current_graph);
+    let system_prompt = llm::build_system_prompt(&state.registry);
+
+    let user_prompt = format!(
+        "The developer wants to make minor refinements or tweaks to the existing flow graph.\n\n### Project Context:\n{}\n\n### Developer's Refinement Request:\n{}",
+        context, body.prompt
+    );
+
+    let history_ref = body.history.as_deref();
+    let proposed_graph = llm::call_anthropic_api(&api_key, &system_prompt, &user_prompt, history_ref).await?;
+    llm::validate_proposed_graph(&proposed_graph, &state.registry)?;
+
+    Ok(Json(proposed_graph))
+}
+
+/// `POST /api/projects/:slug/audit` — run security audit static analysis scans on the user-project
+async fn audit_project(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+) -> Result<Json<crate::projects::security::SecurityAuditReport>, ApiError> {
+    let slug = parse_slug(&slug)?;
+    // Confirm project exists
+    let _ = state.store.load(&slug).await?;
+
+    let graph = state.store.load_graph(&slug).await?;
+    let project_dir = state.store.root().join(slug.as_str());
+
+    let report = crate::projects::security::run_security_audit(&project_dir, &graph).await;
+
+    Ok(Json(report))
+}
+

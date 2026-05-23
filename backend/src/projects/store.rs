@@ -131,6 +131,7 @@ impl ProjectStore {
             position: crate::projects::types::Position { x: 0.0, y: 0.0 },
             config: serde_json::json!({"bind_address": "127.0.0.1:8080", "log_level": "info"}),
             label: Some("main.rs".into()),
+            comment: None,
         });
         write_json_atomic(&dir.join(GRAPH_FILE), &initial_graph).await?;
 
@@ -450,6 +451,7 @@ mod tests {
             position: crate::projects::types::Position { x: 10.0, y: 20.0 },
             config: serde_json::json!({"path": "/", "method": "GET"}),
             label: Some("root".into()),
+            comment: None,
         });
 
         store.save_graph(&slug("flow"), &g, &registry()).await.unwrap();
@@ -498,6 +500,7 @@ mod tests {
             position: crate::projects::types::Position { x: 0.0, y: 0.0 },
             config: serde_json::Value::Null,
             label: None,
+            comment: None,
         });
         let err = store.save_graph(&slug("badt"), &g, &registry()).await.unwrap_err();
         assert!(matches!(err, ApiError::InvalidGraph(_)));
@@ -516,6 +519,7 @@ mod tests {
             position: crate::projects::types::Position { x: 0.0, y: 0.0 },
             config: serde_json::json!({}),
             label: None,
+            comment: None,
         });
         let err = store.save_graph(&slug("badc"), &g, &registry()).await.unwrap_err();
         assert!(matches!(err, ApiError::InvalidGraph(_)));
@@ -542,6 +546,7 @@ mod tests {
                     position: crate::projects::types::Position { x: 0.0, y: 0.0 },
                     config: serde_json::json!({"name": "X", "fields": []}),
                     label: None,
+                    comment: None,
                 });
                 let reg = registry();
                 store.save_graph(&slug("hot"), &g, &reg).await

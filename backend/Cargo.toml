@@ -36,6 +36,8 @@ prettyplease = "0.2"
 toml_edit = "0.22"
 prost-build = "0.14"
 typify = "0.6"
+reqwest = { version = "0.12", features = ["json"] }
+regex = "1"
 
 [dev-dependencies]
 tower = { version = "0.4", features = ["util"] }
