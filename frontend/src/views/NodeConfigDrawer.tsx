@@ -3,6 +3,7 @@ import { type Template, type ParsedDiagnostic } from "../api";
 import SchemaForm from "./SchemaForm";
 
 interface NodeConfigDrawerProps {
+  slug: string;
   nodeId: string;
   templateId: string;
   config: unknown;
@@ -17,6 +18,7 @@ interface NodeConfigDrawerProps {
 /// Side panel that opens when a node is selected on the canvas.
 /// Renders a form generated from the template's JSON Schema.
 export default function NodeConfigDrawer({
+  slug,
   nodeId,
   templateId,
   config,
@@ -58,6 +60,7 @@ export default function NodeConfigDrawer({
             value={config}
             diagnostics={diagnostics}
             onChange={onChange}
+            slug={slug}
           />
         ) : (
           <p className="muted">template not found</p>

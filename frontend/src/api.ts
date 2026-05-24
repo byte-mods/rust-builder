@@ -288,6 +288,50 @@ export async function deleteProject(slug: string, signal?: AbortSignal): Promise
   });
 }
 
+/// `POST /api/projects/import` — uploads a binary .flow package to import it.
+export async function importProject(
+  fileBytes: ArrayBuffer,
+  signal?: AbortSignal,
+): Promise<Project> {
+  const url = `${API_BASE}/api/projects/import`;
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/octet-stream",
+      },
+      body: fileBytes,
+      signal,
+    });
+  } catch (cause: unknown) {
+    if (cause instanceof DOMException && cause.name === "AbortError") {
+      throw cause;
+    }
+    throw new ApiError("network", "studio backend is unreachable", null);
+  }
+
+  if (!res.ok) {
+    let parsed: unknown = null;
+    try {
+      parsed = await res.json();
+    } catch {
+      // Body wasn't JSON
+    }
+    if (parsed && typeof parsed === "object" && "error" in parsed && "message" in parsed) {
+      const err = parsed as { error: string; message: string };
+      throw new ApiError(err.error, err.message, res.status);
+    }
+    throw new ApiError(
+      "malformed_response",
+      `backend returned HTTP ${res.status} with a body the client could not parse`,
+      res.status,
+    );
+  }
+
+  return res.json() as Promise<Project>;
+}
+
 /// `GET /api/projects/:slug/graph`.
 export async function loadGraph(slug: string, signal?: AbortSignal): Promise<Graph> {
   return request<Graph>("GET", `/api/projects/${encodeURIComponent(slug)}/graph`, { signal });
@@ -504,4 +548,44 @@ export async function runSecurityAudit(
     { signal }
   );
 }
+
+export interface DbColumn {
+  name: string;
+  data_type: string;
+  nullable: boolean;
+  primary_key: boolean;
+}
+
+export interface DbRelation {
+  column: string;
+  referenced_table: string;
+  referenced_column: string;
+}
+
+export interface DbTable {
+  name: string;
+  columns: DbColumn[];
+  relations: DbRelation[];
+}
+
+export interface DbSchemaReport {
+  tables: DbTable[];
+}
+
+/// `POST /api/projects/:slug/db/schema` — introspect a database schema from connection string.
+export async function fetchDbSchema(
+  slug: string,
+  connectionString: string,
+  signal?: AbortSignal,
+): Promise<DbSchemaReport> {
+  return request<DbSchemaReport>(
+    "POST",
+    `/api/projects/${encodeURIComponent(slug)}/db/schema`,
+    {
+      body: { connection_string: connectionString },
+      signal,
+    }
+  );
+}
+
 

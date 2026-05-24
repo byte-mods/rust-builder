@@ -21,6 +21,7 @@ use rust_no_code_studio::{projects::ProjectStore, router, templates::TemplateReg
 use serde_json::{json, Value};
 use tempfile::TempDir;
 use tower::ServiceExt;
+use sqlx::{Connection, Executor};
 
 /// Build a router backed by a fresh tempdir-backed store. The `TempDir` is
 /// returned so the test binding keeps it alive — dropping it deletes the
@@ -805,6 +806,7 @@ async fn test_step_debugger_lifecycle() {
 
     // 6. Loop and assert we hit the breakpoints and can resume cleanly
     let mut saw_paused = false;
+    #[allow(unused_assignments)]
     let mut saw_after = false;
 
     loop {
@@ -918,4 +920,246 @@ async fn test_security_audit_endpoint_e2e() {
     // Verify score is lowered
     assert!(report.security_score < 100);
 }
+
+#[tokio::test]
+async fn test_flow_export_and_import_endpoints_e2e() {
+    let (app, _dir) = harness().await;
+
+    // 1. Create a project
+    let (status1, _) = send_json(
+        app.clone(),
+        Method::POST,
+        "/api/projects",
+        Some(&json!({"slug": "e2e-flow", "name": "E2E Flow Project"})),
+    )
+    .await;
+    assert_eq!(status1, StatusCode::CREATED);
+
+    // 2. Export it via GET /api/projects/:slug/export
+    let req_export = Request::builder()
+        .method(Method::GET)
+        .uri("/api/projects/e2e-flow/export")
+        .body(Body::empty())
+        .unwrap();
+    let res_export = app.clone().oneshot(req_export).await.unwrap();
+    assert_eq!(res_export.status(), StatusCode::OK);
+    
+    // Check headers
+    let content_type = res_export.headers().get(axum::http::header::CONTENT_TYPE).unwrap();
+    assert_eq!(content_type, "application/octet-stream");
+    let content_disp = res_export.headers().get(axum::http::header::CONTENT_DISPOSITION).unwrap();
+    assert!(content_disp.to_str().unwrap().contains("e2e-flow.flow"));
+
+    let zip_bytes = res_export
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    assert!(!zip_bytes.is_empty(), "Exported flow bytes should not be empty");
+
+    // 3. Import it back via POST /api/projects/import!
+    // Since "e2e-flow" exists, this will collide and get slug "e2e-flow-import"
+    let req_import = Request::builder()
+        .method(Method::POST)
+        .uri("/api/projects/import")
+        .header("content-type", "application/octet-stream")
+        .body(Body::from(zip_bytes))
+        .unwrap();
+    
+    let res_import = app.clone().oneshot(req_import).await.unwrap();
+    assert_eq!(res_import.status(), StatusCode::OK);
+
+    let import_bytes = res_import
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let imported_project: Value = serde_json::from_slice(&import_bytes).unwrap();
+    
+    assert_eq!(imported_project["slug"], "e2e-flow-import");
+    assert_eq!(imported_project["name"], "E2E Flow Project (Imported)");
+}
+
+#[tokio::test]
+async fn test_db_schema_introspection_endpoint() {
+    let (app, _dir) = harness().await;
+
+    // 1. Create a project
+    let (status1, _) = send_json(
+        app.clone(),
+        Method::POST,
+        "/api/projects",
+        Some(&json!({"slug": "db-test", "name": "DB Introspect Project"})),
+    )
+    .await;
+    assert_eq!(status1, StatusCode::CREATED);
+
+    // 2. Set up a temporary SQLite database
+    let temp_db_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_db_dir.path().join("test.sqlite");
+    std::fs::File::create(&db_path).unwrap();
+    let conn_str = format!("sqlite://{}", db_path.to_str().unwrap());
+
+    // Create a table inside the temporary SQLite database
+    {
+        sqlx::any::install_default_drivers();
+        let mut conn = sqlx::AnyConnection::connect(&conn_str).await.unwrap();
+        conn.execute("CREATE TABLE products (id INTEGER PRIMARY KEY NOT NULL, name TEXT NOT NULL, price REAL);").await.unwrap();
+    }
+
+    // 3. Request introspection via POST /api/projects/:slug/db/schema
+    let (status2, body2) = send_json(
+        app.clone(),
+        Method::POST,
+        "/api/projects/db-test/db/schema",
+        Some(&json!({
+            "connection_string": conn_str
+        })),
+    )
+    .await;
+    
+    assert_eq!(status2, StatusCode::OK);
+    
+    let tables = body2["tables"].as_array().unwrap();
+    assert_eq!(tables.len(), 1);
+    
+    let product_table = &tables[0];
+    assert_eq!(product_table["name"], "products");
+    
+    let cols = product_table["columns"].as_array().unwrap();
+    assert_eq!(cols.len(), 3);
+    
+    let id_col = cols.iter().find(|c| c["name"] == "id").unwrap();
+    assert_eq!(id_col["data_type"], "integer");
+    assert!(id_col["primary_key"].as_bool().unwrap());
+    assert!(!id_col["nullable"].as_bool().unwrap());
+
+    let price_col = cols.iter().find(|c| c["name"] == "price").unwrap();
+    assert_eq!(price_col["data_type"], "real");
+    assert!(!price_col["primary_key"].as_bool().unwrap());
+    assert!(price_col["nullable"].as_bool().unwrap());
+}
+
+#[tokio::test]
+async fn test_grpc_scaffolder_pipeline() {
+    let (app, dir) = harness().await;
+
+    // 1. Create project grpc-test
+    let (status1, _) = send_json(
+        app.clone(),
+        Method::POST,
+        "/api/projects",
+        Some(&json!({"slug": "grpc-test", "name": "gRPC Test"})),
+    )
+    .await;
+    assert_eq!(status1, StatusCode::CREATED);
+
+    // 2. PUT a graph containing gRPC Server and a custom block handler
+    let graph = json!({
+        "schema_version": 1,
+        "nodes": [
+            {
+                "id": "entry",
+                "template_id": "core.entry_point",
+                "position": {"x": 0.0, "y": 0.0},
+                "config": {}
+            },
+            {
+                "id": "grpc_server",
+                "template_id": "grpc.server",
+                "position": {"x": 100.0, "y": 0.0},
+                "config": {
+                    "address": "[::1]:50051",
+                    "service_name": "Greeter",
+                    "proto_definition": "syntax = \"proto3\";\npackage hello;\nservice Greeter {\n  rpc SayHello (HelloRequest) returns (HelloReply);\n}\nmessage HelloRequest {\n  string name = 1;\n}\nmessage HelloReply {\n  string message = 1;\n}"
+                }
+            },
+            {
+                "id": "custom",
+                "template_id": "custom.block",
+                "position": {"x": 250.0, "y": 0.0},
+                "config": {
+                    "name": "say_hello_handler",
+                    "code": "pub fn execute(req: crate::grpc::server_grpc_server::proto_grpc_server::HelloRequest) -> Result<crate::grpc::server_grpc_server::proto_grpc_server::HelloReply, crate::errors::AppError> {\n    Ok(crate::grpc::server_grpc_server::proto_grpc_server::HelloReply { message: format!(\"Hello, {}!\", req.name) })\n}"
+                }
+            }
+        ],
+        "edges": [
+            {
+                "id": "e1",
+                "source": "entry",
+                "source_port": "service",
+                "target": "grpc_server",
+                "target_port": "entry"
+            },
+            {
+                "id": "e2",
+                "source": "grpc_server",
+                "source_port": "SayHello",
+                "target": "custom",
+                "target_port": "req"
+            }
+        ]
+    });
+
+    let (status2, body2) = send_json(
+        app.clone(),
+        Method::PUT,
+        "/api/projects/grpc-test/graph",
+        Some(&graph),
+    )
+    .await;
+    if status2 != StatusCode::OK {
+        panic!("PUT graph failed: status={}, body={:?}", status2, body2);
+    }
+    assert_eq!(status2, StatusCode::OK);
+
+    // Verify dynamic ports generated on the grpc.server node!
+    let nodes = body2["nodes"].as_array().unwrap();
+    let server_node = nodes.iter().find(|n| n["id"] == "grpc_server").unwrap();
+    let server_outputs = server_node["config"]["outputs"].as_array().unwrap();
+    assert_eq!(server_outputs.len(), 1);
+    assert_eq!(server_outputs[0]["name"], "SayHello");
+    assert_eq!(server_outputs[0]["ty"], "HelloRequest");
+
+    // 3. Trigger project regeneration
+    let (status3, body3) = send_json(
+        app.clone(),
+        Method::POST,
+        "/api/projects/grpc-test/regen",
+        None,
+    )
+    .await;
+    if status3 != StatusCode::OK {
+        panic!("Regen failed! status={}, body={:#?}", status3, body3);
+    }
+    assert_eq!(status3, StatusCode::OK);
+
+    let files_written = body3["files_written"].as_array().unwrap();
+    let file_paths: Vec<&str> = files_written.iter().map(|f| f.as_str().unwrap()).collect();
+
+    // Verify all gRPC files were written!
+    assert!(file_paths.contains(&"src/../build.rs"));
+    assert!(file_paths.contains(&"src/../proto/grpc_server_grpc_server.proto"));
+    assert!(file_paths.contains(&"src/grpc/server_grpc_server.rs"));
+    assert!(file_paths.contains(&"Cargo.toml"));
+
+    // 4. Verify build.rs contents
+    let build_rs_path = dir.path().join("grpc-test/build.rs");
+    assert!(build_rs_path.exists());
+    let build_rs_src = std::fs::read_to_string(build_rs_path).unwrap();
+    assert!(build_rs_src.contains("tonic_build::compile_protos"));
+
+    // 5. Verify Cargo.toml build-dependencies section was written
+    let cargo_toml_path = dir.path().join("grpc-test/Cargo.toml");
+    assert!(cargo_toml_path.exists());
+    let cargo_toml_src = std::fs::read_to_string(cargo_toml_path).unwrap();
+    assert!(cargo_toml_src.contains("[build-dependencies]"));
+    assert!(cargo_toml_src.contains("tonic-build = \"0.10\""));
+}
+
+
+
 

@@ -9,6 +9,7 @@ import {
   useNodesState,
   useEdgesState,
   useReactFlow,
+  useViewport,
   type Node,
   type Edge,
   type Connection,
@@ -93,7 +94,7 @@ function toRfNode(
       label: gn.label ?? gn.id,
       templateId,
       config: gn.config ?? {},
-      inputs: templateId === "custom.block"
+      inputs: (templateId === "custom.block" || templateId === "grpc.server")
         ? (gn.config?.inputs || []).map((p: any) => ({
             name: p.name,
             type_tag: p.ty,
@@ -101,7 +102,7 @@ function toRfNode(
             doc: `Custom parameter ${p.name} of type ${p.ty}`,
           }))
         : template?.input_ports ?? [],
-      outputs: templateId === "custom.block"
+      outputs: (templateId === "custom.block" || templateId === "grpc.server")
         ? (gn.config?.outputs || []).map((p: any) => ({
             name: p.name,
             type_tag: p.ty,
@@ -154,6 +155,79 @@ export default function ProjectCanvas({ slug, onBack }: ProjectCanvasProps): JSX
   );
 }
 
+interface Collaborator {
+  id: string;
+  username: string;
+  color: string;
+}
+
+function CursorsOverlay({ cursors, collaborators }: { cursors: Record<string, { userId: string, x: number, y: number }>, collaborators: Collaborator[] }): JSX.Element {
+  const { x, y, zoom } = useViewport();
+  
+  return (
+    <div style={{ position: "absolute", inset: 0, pointerEvents: "none", zIndex: 10 }}>
+      {Object.values(cursors).map((cursor) => {
+        const collab = collaborators.find((c) => c.id === cursor.userId);
+        if (!collab) return null;
+        
+        const posX = cursor.x * zoom + x;
+        const posY = cursor.y * zoom + y;
+        
+        return (
+          <div
+            key={cursor.userId}
+            style={{
+              position: "absolute",
+              left: `${posX}px`,
+              top: `${posY}px`,
+              transform: "translate(-2px, -2px)",
+              transition: "left 0.08s ease-out, top 0.08s ease-out",
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "flex-start",
+              pointerEvents: "none",
+            }}
+          >
+            <svg
+              width="24"
+              height="24"
+              viewBox="0 0 24 24"
+              fill="none"
+              style={{
+                filter: "drop-shadow(0 2px 4px rgba(0,0,0,0.4))",
+              }}
+            >
+              <path
+                d="M3 3V21L9 15L15 21L17 19L11 13L17 7L3 3Z"
+                fill={collab.color}
+                stroke="#ffffff"
+                strokeWidth="1.5"
+                strokeLinejoin="round"
+              />
+            </svg>
+            <div
+              style={{
+                backgroundColor: collab.color,
+                color: "#0f172a",
+                padding: "2px 6px",
+                borderRadius: "4px",
+                fontSize: "10px",
+                fontWeight: "bold",
+                marginTop: "2px",
+                whiteSpace: "nowrap",
+                border: "1px solid rgba(255,255,255,0.3)",
+                boxShadow: "0 4px 12px rgba(0,0,0,0.3)",
+              }}
+            >
+              {collab.username}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
   const [state, setState] = useState<LoadState>({ kind: "loading" });
   const [templates, setTemplates] = useState<Template[]>([]);
@@ -173,6 +247,28 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
   const linesEndRef = useRef<HTMLDivElement | null>(null);
 
   const saveTimerRef = useRef<number | null>(null);
+
+  const myCollabUser = useMemo(() => {
+    const key = `collab_user_${slug}`;
+    const cached = sessionStorage.getItem(key);
+    if (cached) return JSON.parse(cached);
+    
+    const id = Math.random().toString(36).substring(2, 11);
+    const colors = ["#3b82f6", "#ec4899", "#8b5cf6", "#10b981", "#f59e0b", "#ef4444", "#06b6d4"];
+    const color = colors[Math.floor(Math.random() * colors.length)];
+    const personas = ["Tonic-Scaffolder", "Tokio-Scheduler", "Cargo-Linker", "Rust-Architect", "Wasm-Compiler", "Flow-Designer"];
+    const username = `${personas[Math.floor(Math.random() * personas.length)]}-${Math.floor(100 + Math.random() * 900)}`;
+    
+    const user = { id, username, color };
+    sessionStorage.setItem(key, JSON.stringify(user));
+    return user;
+  }, [slug]);
+
+  const [collaborators, setCollaborators] = useState<Collaborator[]>([]);
+  const [cursors, setCursors] = useState<Record<string, { userId: string, x: number, y: number }>>({});
+  const collabWsRef = useRef<WebSocket | null>(null);
+  const isRemoteUpdateRef = useRef<boolean>(false);
+  const lastCursorSendRef = useRef<number>(0);
 
   // Premium AI Chat Console state variables
   interface SavedChatMessage {
@@ -892,6 +988,7 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
   // Debounced save
   const scheduleSave = useCallback(
     (nextNodes: Node<NodeData>[], nextEdges: Edge[]) => {
+      if (isRemoteUpdateRef.current) return;
       if (saveTimerRef.current) {
         window.clearTimeout(saveTimerRef.current);
       }
@@ -901,14 +998,134 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
           nodes: nextNodes.map(fromRfNode),
           edges: nextEdges.map(fromRfEdge),
         };
-        saveGraph(slug, graph).catch((err: unknown) => {
+        saveGraph(slug, graph).then(() => {
+          if (collabWsRef.current && collabWsRef.current.readyState === WebSocket.OPEN) {
+            collabWsRef.current.send(JSON.stringify({
+              type: "graph_edit",
+              user_id: myCollabUser.id,
+              graph: graph,
+            }));
+          }
+        }).catch((err: unknown) => {
           if (err instanceof ApiError) {
             console.error("save failed:", err.message);
           }
         });
       }, 800);
     },
-    [slug]
+    [slug, myCollabUser]
+  );
+
+  useEffect(() => {
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const host = window.location.host;
+    const wsUrl = `${protocol}//${host}/ws/collab/${slug}`;
+    
+    const ws = new WebSocket(wsUrl);
+    collabWsRef.current = ws;
+    
+    ws.onopen = () => {
+      ws.send(JSON.stringify({
+        type: "join",
+        user: myCollabUser,
+      }));
+    };
+    
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        switch (data.type) {
+          case "presence": {
+            const activeUsers = data.users;
+            setCollaborators(activeUsers.filter((u: Collaborator) => u.id !== myCollabUser.id));
+            setCursors((current) => {
+              const next = { ...current };
+              for (const id of Object.keys(next)) {
+                if (!activeUsers.some((u: Collaborator) => u.id === id)) {
+                  delete next[id];
+                }
+              }
+              return next;
+            });
+            break;
+          }
+          case "cursor": {
+            const { user_id, x, y } = data;
+            setCursors((current) => ({
+              ...current,
+              [user_id]: { userId: user_id, x, y },
+            }));
+            break;
+          }
+          case "node_drag": {
+            const { node_id, x, y } = data;
+            isRemoteUpdateRef.current = true;
+            setNodes((current) =>
+              current.map((n) => (n.id === node_id ? { ...n, position: { x, y } } : n))
+            );
+            setTimeout(() => {
+              isRemoteUpdateRef.current = false;
+            }, 50);
+            break;
+          }
+          case "graph_edit": {
+            const remoteGraph = data.graph;
+            isRemoteUpdateRef.current = true;
+            setNodes(remoteGraph.nodes.map(toRfNode));
+            setEdges(remoteGraph.edges.map(toRfEdge));
+            setTimeout(() => {
+              isRemoteUpdateRef.current = false;
+            }, 50);
+            break;
+          }
+          default:
+            break;
+        }
+      } catch (e) {
+        console.error("failed to parse WS message:", e);
+      }
+    };
+    
+    return () => {
+      ws.close();
+      collabWsRef.current = null;
+    };
+  }, [slug, myCollabUser, setNodes, setEdges]);
+
+  const onCanvasPointerMove = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      const now = Date.now();
+      if (now - lastCursorSendRef.current < 40) return;
+      lastCursorSendRef.current = now;
+
+      if (!collabWsRef.current || collabWsRef.current.readyState !== WebSocket.OPEN) return;
+      const flowPos = screenToFlowPosition({ x: e.clientX, y: e.clientY });
+      collabWsRef.current.send(JSON.stringify({
+        type: "cursor",
+        user_id: myCollabUser.id,
+        x: flowPos.x,
+        y: flowPos.y,
+      }));
+    },
+    [screenToFlowPosition, myCollabUser]
+  );
+
+  const onNodeDrag = useCallback(
+    (_event: React.MouseEvent, node: Node) => {
+      const now = Date.now();
+      if (now - lastCursorSendRef.current < 40) return;
+      lastCursorSendRef.current = now;
+
+      if (!collabWsRef.current || collabWsRef.current.readyState !== WebSocket.OPEN) return;
+      collabWsRef.current.send(JSON.stringify({
+        type: "node_drag",
+        user_id: myCollabUser.id,
+        node_id: node.id,
+        x: node.position.x,
+        y: node.position.y,
+      }));
+    },
+    [myCollabUser]
   );
 
   const onConnect = useCallback(
@@ -1027,6 +1244,104 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
     });
   }
 
+  const handleAutoLayout = useCallback(() => {
+    if (proposedGraph || nodes.length === 0) return;
+
+    // 1. Identify roots (nodes with no incoming edges or the EntryPoint)
+    const incomingCount: Record<string, number> = {};
+    nodes.forEach((n) => {
+      incomingCount[n.id] = 0;
+    });
+    edges.forEach((e) => {
+      if (incomingCount[e.target] !== undefined) {
+        incomingCount[e.target]++;
+      }
+    });
+
+    const roots = nodes.filter(
+      (n) => n.data.templateId === "core.entry_point" || incomingCount[n.id] === 0
+    );
+    const rootNodes = roots.length > 0 ? roots : [nodes[0]];
+
+    // 2. BFS Traversal to compute hierarchical levels (ranks)
+    const levels: Record<string, number> = {};
+    nodes.forEach((n) => {
+      levels[n.id] = 0;
+    });
+
+    const queue: string[] = [];
+    rootNodes.forEach((r) => {
+      levels[r.id] = 0;
+      queue.push(r.id);
+    });
+
+    // Build adjacent list representation
+    const adj: Record<string, string[]> = {};
+    nodes.forEach((n) => {
+      adj[n.id] = [];
+    });
+    edges.forEach((e) => {
+      if (adj[e.source]) {
+        adj[e.source].push(e.target);
+      }
+    });
+
+    while (queue.length > 0) {
+      const curr = queue.shift()!;
+      const currLevel = levels[curr];
+      const children = adj[curr] || [];
+      
+      children.forEach((child) => {
+        // Support deep traversal — level of child is max(child_level, parent_level + 1)
+        if (levels[child] < currLevel + 1) {
+          levels[child] = currLevel + 1;
+          queue.push(child);
+        }
+      });
+    }
+
+    // 3. Group nodes by level
+    const levelGroups: Record<number, string[]> = {};
+    nodes.forEach((n) => {
+      const lvl = levels[n.id];
+      if (!levelGroups[lvl]) {
+        levelGroups[lvl] = [];
+      }
+      levelGroups[lvl].push(n.id);
+    });
+
+    // 4. Position nodes based on Level (X) and Level Index (Y)
+    const horizontalSpacing = 280;
+    const verticalSpacing = 180;
+    const yCenterOffset = 250;
+
+    const nextNodes = nodes.map((node) => {
+      const lvl = levels[node.id];
+      const group = levelGroups[lvl] || [node.id];
+      const index = group.indexOf(node.id);
+      const count = group.length;
+
+      // Position
+      const x = lvl * horizontalSpacing;
+      // Center vertically within column
+      const y = (index - (count - 1) / 2) * verticalSpacing + yCenterOffset;
+
+      return {
+        ...node,
+        position: { x, y },
+      };
+    });
+
+    // 5. Update state and trigger save
+    setNodes(nextNodes);
+    scheduleSave(nextNodes, edges);
+
+    // Auto-fit the canvas to show the new layout beautifully
+    setTimeout(() => {
+      fitView({ duration: 600, padding: 0.15 });
+    }, 100);
+  }, [nodes, edges, proposedGraph, scheduleSave, setNodes, fitView]);
+
   async function handleBuild(release = false) {
     setBuildLines([]);
     setBuildState({ kind: "running" });
@@ -1097,6 +1412,57 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
         <span className="muted">
           {graphToShow.nodes.length} nodes · {graphToShow.edges.length} edges
         </span>
+        <div className="collaborators-bar" style={{ display: "flex", alignItems: "center", gap: "6px", marginLeft: "auto", marginRight: "12px" }}>
+          {collaborators.map((user) => {
+            const initials = user.username.split("-")[0].substring(0, 2).toUpperCase();
+            return (
+              <div
+                key={user.id}
+                className="collaborator-avatar"
+                style={{
+                  width: "28px",
+                  height: "28px",
+                  borderRadius: "50%",
+                  backgroundColor: user.color,
+                  color: "#0f172a",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  fontSize: "11px",
+                  fontWeight: "bold",
+                  border: "2px solid #1e293b",
+                  boxShadow: `0 0 8px ${user.color}80`,
+                }}
+                title={user.username}
+              >
+                {initials}
+              </div>
+            );
+          })}
+          <div
+            className="collaborator-avatar current"
+            style={{
+              width: "28px",
+              height: "28px",
+              borderRadius: "50%",
+              backgroundColor: myCollabUser.color,
+              color: "#0f172a",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              fontSize: "11px",
+              fontWeight: "bold",
+              border: "2px solid #38bdf8",
+              boxShadow: `0 0 8px ${myCollabUser.color}cc`,
+            }}
+            title={`${myCollabUser.username} (You)`}
+          >
+            {myCollabUser.username.split("-")[0].substring(0, 2).toUpperCase()}
+          </div>
+        </div>
+        <button type="button" className="btn-auto-layout" onClick={handleAutoLayout}>
+          🪄 Auto-Layout
+        </button>
       </header>
 
       {proposedGraph && (
@@ -1341,7 +1707,7 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
             </div>
           </aside>
 
-          <main className="studio-canvas" style={{ position: "relative" }}>
+          <main className="studio-canvas" style={{ position: "relative" }} onPointerMove={onCanvasPointerMove}>
             <ReactFlow<Node<NodeData>>
               nodes={displayNodes}
               edges={displayEdges}
@@ -1352,6 +1718,7 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
               onNodeDoubleClick={onNodeDoubleClick}
               onDragOver={onDragOver}
               onDrop={onDrop}
+              onNodeDrag={onNodeDrag}
               fitView
               nodesDraggable={!proposedGraph}
               nodesConnectable={!proposedGraph}
@@ -1362,6 +1729,8 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
               <Controls />
               <MiniMap pannable zoomable />
             </ReactFlow>
+
+            <CursorsOverlay cursors={cursors} collaborators={collaborators} />
 
             {debugModeActive && (
               <div className="premium-debugger-bar">
@@ -1408,6 +1777,7 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
 
           {selectedNode && (
             <NodeConfigDrawer
+              slug={slug || ""}
               nodeId={selectedNode.id}
               templateId={selectedNode.data.templateId}
               config={selectedNode.data.config}

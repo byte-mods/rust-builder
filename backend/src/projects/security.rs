@@ -81,6 +81,7 @@ struct OSVVulnMinimal {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct OSVVulnDetails {
     id: String,
     summary: Option<String>,
@@ -97,6 +98,7 @@ struct OSVReference {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct OSVAffected {
     package: Option<OSVAffectedPackage>,
     ecosystem_specific: Option<serde_json::Value>,
@@ -104,6 +106,7 @@ struct OSVAffected {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct OSVAffectedPackage {
     name: String,
 }
@@ -580,15 +583,17 @@ dependencies = [
                         "aws_secret": "my aws secret: 'abc123DEF456/789xyz123ABCdef456XYZ/789+A'"
                     }),
                     label: None,
+                    comment: None,
                 },
                 Node {
                     id: NodeId("node_2".to_string()),
                     template_id: TemplateId::new("integration.scheduler").unwrap(),
                     position: crate::projects::types::Position { x: 0.0, y: 0.0 },
                     config: json!({
-                        "slack_url": "https://hooks.slack.example/services/EXAMPLE/EXAMPLE/EXAMPLE"
+                        "slack_url": "https://hooks.slack.com/services/T12345678/B12345678/A123456789012345678901234"
                     }),
                     label: None,
+                    comment: None,
                 },
                 Node {
                     id: NodeId("node_3".to_string()),
@@ -599,6 +604,7 @@ dependencies = [
                         "db_conn": "postgres://root:my_secret_pwd@localhost/database"
                     }),
                     label: None,
+                    comment: None,
                 }
             ],
             edges: vec![],
@@ -638,6 +644,7 @@ dependencies = [
                         "#
                     }),
                     label: None,
+                    comment: None,
                 },
                 Node {
                     id: NodeId("node_2".to_string()),
@@ -650,6 +657,7 @@ dependencies = [
                         "#
                     }),
                     label: None,
+                    comment: None,
                 },
                 Node {
                     id: NodeId("node_3".to_string()),
@@ -660,6 +668,7 @@ dependencies = [
                         "require_auth": false
                     }),
                     label: None,
+                    comment: None,
                 }
             ],
             edges: vec![],

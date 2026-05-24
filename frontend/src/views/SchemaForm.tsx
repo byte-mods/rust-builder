@@ -1,6 +1,7 @@
-import { useCallback } from "react";
+import { useCallback, useState } from "react";
 import MonacoEditor, { type EditorMarker } from "../components/MonacoEditor";
 import { type ParsedDiagnostic } from "../api";
+import SqlBuilder from "./SqlBuilder";
 
 const CODE_FIELDS: Record<string, { height: string; language: string }> = {
   body: { height: "220px", language: "rust" },
@@ -10,6 +11,8 @@ const CODE_FIELDS: Record<string, { height: string; language: string }> = {
   expr: { height: "110px", language: "rust" },
   where_clause: { height: "100px", language: "rust" },
   code: { height: "380px", language: "rust" },
+  query: { height: "160px", language: "sql" },
+  proto_definition: { height: "320px", language: "proto" },
 };
 
 interface SchemaFormProps {
@@ -17,6 +20,7 @@ interface SchemaFormProps {
   value: unknown;
   diagnostics?: ParsedDiagnostic[];
   onChange: (value: unknown) => void;
+  slug?: string;
 }
 
 /// Best-effort dynamic form renderer from a JSON Schema object.
@@ -26,6 +30,7 @@ export default function SchemaForm({
   value,
   diagnostics = [],
   onChange,
+  slug,
 }: SchemaFormProps): JSX.Element {
   const objValue = (typeof value === "object" && value !== null ? value : {}) as Record<string, unknown>;
 
@@ -61,6 +66,8 @@ export default function SchemaForm({
             required={required.has(key)}
             diagnostics={diagnostics}
             onChange={(v) => setField(key, v)}
+            siblingValues={objValue}
+            slug={slug}
           />
         ))}
     </div>
@@ -74,6 +81,8 @@ interface SchemaFieldProps {
   required: boolean;
   diagnostics?: ParsedDiagnostic[];
   onChange: (value: unknown) => void;
+  siblingValues?: Record<string, unknown>;
+  slug?: string;
 }
 
 function SchemaField({
@@ -83,7 +92,11 @@ function SchemaField({
   required,
   diagnostics = [],
   onChange,
+  siblingValues,
+  slug,
 }: SchemaFieldProps): JSX.Element {
+  const [showSqlBuilder, setShowSqlBuilder] = useState(false);
+
   if (typeof schema !== "object" || schema === null) {
     return (
       <label>
@@ -170,8 +183,29 @@ function SchemaField({
         });
 
         return (
-          <label>
-            {name}{required && <span className="required">*</span>}
+          <label className="code-field-label">
+            <div className="code-field-header" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.4rem" }}>
+              <span>{name}{required && <span className="required">*</span>}</span>
+              {name === "query" && (
+                <button
+                  type="button"
+                  className="btn-sql-builder-trigger"
+                  onClick={() => setShowSqlBuilder(true)}
+                  style={{
+                    fontSize: "0.72rem",
+                    padding: "0.25rem 0.6rem",
+                    background: "rgba(124, 58, 237, 0.25)",
+                    border: "1px solid rgba(124, 58, 237, 0.4)",
+                    color: "#a78bfa",
+                    borderRadius: "4px",
+                    cursor: "pointer",
+                    transition: "all 0.2s ease"
+                  }}
+                >
+                  🪄 Visual SQL Builder
+                </button>
+              )}
+            </div>
             <MonacoEditor
               value={typeof value === "string" ? value : ""}
               onChange={onChange}
@@ -179,6 +213,20 @@ function SchemaField({
               language={spec.language}
               markers={markers}
             />
+            {name === "query" && showSqlBuilder && (
+              <div className="sql-builder-drawer-overlay">
+                <SqlBuilder
+                  slug={slug ?? ""}
+                  connectionString={(siblingValues?.connection_string ?? "") as string}
+                  initialQuery={typeof value === "string" ? value : ""}
+                  onSave={(q) => {
+                    onChange(q);
+                    setShowSqlBuilder(false);
+                  }}
+                  onClose={() => setShowSqlBuilder(false)}
+                />
+              </div>
+            )}
           </label>
         );
       }

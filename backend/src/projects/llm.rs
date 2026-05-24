@@ -7,7 +7,7 @@ use std::fs;
 use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use crate::projects::types::{Graph, Slug};
+use crate::projects::types::Graph;
 use crate::templates::TemplateRegistry;
 use crate::error::ApiError;
 
@@ -100,6 +100,7 @@ struct AnthropicResponse {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
 enum ContentItem {
     Text { text: String },
     ToolUse { id: String, name: String, input: Value },
@@ -158,12 +159,49 @@ These are the ONLY pre-installed node templates you can place on the canvas:
 "#,
         templates_json
     )
+}#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmProvider {
+    Anthropic,
+    OpenAi,
+    Codex,
+    ClaudeCli,
+    DeepSeek,
+    Kimi,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ChatMessage {
     pub role: String, // "user" or "assistant"
     pub content: String,
+}
+
+/// Robust JSON graph extraction from response text.
+/// Safely handles markdown-fenced JSON blocks (e.g. ```json ... ```) or pure JSON strings,
+/// making the parsing resilient across different LLM formats.
+pub fn extract_graph_from_text(text: &str) -> Result<Graph, ApiError> {
+    let trimmed = text.trim();
+    let raw_json = if let Some(start_idx) = trimmed.find("```json") {
+        let after_fence = &trimmed[start_idx + 7..];
+        if let Some(end_idx) = after_fence.find("```") {
+            after_fence[..end_idx].trim()
+        } else {
+            after_fence.trim()
+        }
+    } else if let Some(start_idx) = trimmed.find("```") {
+        let after_fence = &trimmed[start_idx + 3..];
+        if let Some(end_idx) = after_fence.find("```") {
+            after_fence[..end_idx].trim()
+        } else {
+            after_fence.trim()
+        }
+    } else {
+        trimmed
+    };
+
+    let graph: Graph = serde_json::from_str(raw_json)
+        .map_err(|e| ApiError::LlmError(format!("LLM returned an invalid graph.json structure: {e}")))?;
+    Ok(graph)
 }
 
 /// Submits system/user prompts to the Anthropic Messages API, forcing tool-calling structure.
@@ -194,12 +232,12 @@ pub async fn call_anthropic_api(
                             "id": { "type": "string" },
                             "template_id": { "type": "string" },
                             "position": {
-                                "type": "object",
-                                "properties": {
-                                    "x": { "type": "number" },
-                                    "y": { "type": "number" }
-                                },
-                                "required": ["x", "y"]
+                                 "type": "object",
+                                 "properties": {
+                                     "x": { "type": "number" },
+                                     "y": { "type": "number" }
+                                 },
+                                 "required": ["x", "y"]
                             },
                             "config": { "type": "object" },
                             "label": { "type": "string" }
@@ -278,6 +316,134 @@ pub async fn call_anthropic_api(
     extract_graph_from_response(response_val)
 }
 
+/// Unified entry point to call any of the supported LLM providers.
+pub async fn call_llm_api(
+    provider: LlmProvider,
+    api_key: Option<&str>,
+    model: Option<&str>,
+    system_prompt: &str,
+    user_prompt: &str,
+    history: Option<&[ChatMessage]>,
+) -> Result<Graph, ApiError> {
+    match provider {
+        LlmProvider::Anthropic => {
+            let key = api_key.ok_or_else(|| ApiError::LlmError("Anthropic API key is missing".to_string()))?;
+            call_anthropic_api(key, system_prompt, user_prompt, history).await
+        }
+        LlmProvider::OpenAi | LlmProvider::Codex | LlmProvider::DeepSeek | LlmProvider::Kimi => {
+            let (base_url, default_model, auth_header_prefix, env_key_name) = match provider {
+                LlmProvider::OpenAi => ("https://api.openai.com/v1/chat/completions", "gpt-4o", "Bearer", "OPENAI_API_KEY"),
+                LlmProvider::Codex => {
+                    let url = std::env::var("CODEX_API_BASE")
+                        .unwrap_or_else(|_| "https://api.openai.com/v1/chat/completions".to_string());
+                    (Box::leak(url.into_boxed_str()) as &str, "gpt-4o", "Bearer", "CODEX_API_KEY")
+                }
+                LlmProvider::DeepSeek => ("https://api.deepseek.com/chat/completions", "deepseek-chat", "Bearer", "DEEPSEEK_API_KEY"),
+                LlmProvider::Kimi => ("https://api.moonshot.cn/v1/chat/completions", "moonshot-v1-8k", "Bearer", "KIMI_API_KEY"),
+                _ => unreachable!(),
+            };
+
+            let key = match api_key {
+                Some(k) if !k.trim().is_empty() => k.to_string(),
+                _ => std::env::var(env_key_name)
+                    .or_else(|_| {
+                        if provider == LlmProvider::Codex {
+                            std::env::var("OPENAI_API_KEY")
+                        } else {
+                            Err(std::env::VarError::NotPresent)
+                        }
+                    })
+                    .map_err(|_| ApiError::LlmError(format!("API key environment variable `{env_key_name}` is not set")))?
+            };
+
+            let active_model = model.unwrap_or(default_model);
+
+            let client = reqwest::Client::new();
+            let mut messages = Vec::new();
+            messages.push(json!({
+                "role": "system",
+                "content": system_prompt
+            }));
+
+            if let Some(hist) = history {
+                for msg in hist {
+                    messages.push(json!({
+                        "role": msg.role,
+                        "content": msg.content,
+                    }));
+                }
+            }
+
+            messages.push(json!({
+                "role": "user",
+                "content": user_prompt
+            }));
+
+            let payload = json!({
+                "model": active_model,
+                "messages": messages,
+                "response_format": { "type": "json_object" }
+            });
+
+            let res = client
+                .post(base_url)
+                .header("Authorization", format!("{auth_header_prefix} {key}"))
+                .header("Content-Type", "application/json")
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|e| ApiError::LlmError(format!("network request to {provider:?} failed: {e}")))?;
+
+            if !res.status().is_success() {
+                let status = res.status();
+                let body_text = res.text().await.unwrap_or_default();
+                return Err(ApiError::LlmError(format!(
+                    "{provider:?} API returned status {status}: {body_text}"
+                )));
+            }
+
+            let response_val: Value = res
+                .json()
+                .await
+                .map_err(|e| ApiError::LlmError(format!("failed to parse response JSON: {e}")))?;
+
+            let text_content = response_val["choices"][0]["message"]["content"]
+                .as_str()
+                .ok_or_else(|| ApiError::LlmError("API response did not contain expected text choice".to_string()))?;
+
+            extract_graph_from_text(text_content)
+        }
+        LlmProvider::ClaudeCli => {
+            let full_prompt = format!("System Prompt:\n{}\n\nUser Request:\n{}", system_prompt, user_prompt);
+            
+            let output = std::process::Command::new("claude")
+                .arg(&full_prompt)
+                .output();
+
+            match output {
+                Ok(out) if out.status.success() => {
+                    let text = String::from_utf8(out.stdout)
+                        .map_err(|e| ApiError::LlmError(format!("failed to parse Claude CLI stdout: {e}")))?;
+                    extract_graph_from_text(&text)
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    Err(ApiError::LlmError(format!(
+                        "Claude CLI process exited with non-zero status code ({}): {}",
+                        out.status, stderr
+                    )))
+                }
+                Err(e) => {
+                    Err(ApiError::LlmError(format!(
+                        "Claude CLI command execution failed. Is the `claude` CLI tool installed in your system PATH? Error: {}",
+                        e
+                    )))
+                }
+            }
+        }
+    }
+}
+
 /// Runs rigorous post-generation schema and template registry validations
 /// to ensure the LLM's proposed graph conforms 100% to our visual spec.
 pub fn validate_proposed_graph(graph: &Graph, registry: &TemplateRegistry) -> Result<(), ApiError> {
@@ -322,8 +488,7 @@ pub fn validate_proposed_graph(graph: &Graph, registry: &TemplateRegistry) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::projects::types::{NodeId, EdgeId, Position, Edge};
-    use crate::templates::TemplateId;
+    use crate::projects::types::{NodeId, EdgeId, Edge};
 
     #[test]
     fn test_extract_graph_from_tool_use_response() {
@@ -379,6 +544,31 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_graph_from_text_fences() {
+        let text_with_json_fence = r#"
+Here is the updated graph:
+```json
+{
+  "schema_version": 1,
+  "nodes": [
+    {
+      "id": "n_sleep",
+      "template_id": "tokio.sleep",
+      "position": { "x": 100, "y": 200 },
+      "config": { "name": "delay", "duration_ms": 1000 }
+    }
+  ],
+  "edges": []
+}
+```
+        "#;
+        let graph = extract_graph_from_text(text_with_json_fence).unwrap();
+        assert_eq!(graph.schema_version, 1);
+        assert_eq!(graph.nodes.len(), 1);
+        assert_eq!(graph.nodes[0].id.0, "n_sleep");
+    }
+
+    #[test]
     fn test_validate_proposed_graph_finds_dangling_edges() {
         let registry = TemplateRegistry::with_builtins();
         let graph = Graph {
@@ -404,6 +594,7 @@ mod tests {
 
 // Minimal helper to implement test_node in Graph for testing convenience
 impl Graph {
+    #[allow(dead_code)]
     fn test_node(id: &str, template_id: &str, config: Value) -> crate::projects::types::Node {
         crate::projects::types::Node {
             id: crate::projects::types::NodeId(id.to_string()),

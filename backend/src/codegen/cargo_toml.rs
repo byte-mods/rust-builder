@@ -84,6 +84,13 @@ pub fn render(slug: &Slug, extra_deps: &[(String, String)]) -> String {
     for (name, version) in &deps {
         out.push_str(&format!("{name} = {version}\n"));
     }
+
+    let has_grpc = deps.keys().any(|name| name == "tonic");
+    if has_grpc {
+        out.push_str("\n[build-dependencies]\n");
+        out.push_str("tonic-build = \"0.10\"\n");
+    }
+
     out
 }
 

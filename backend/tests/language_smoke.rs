@@ -40,6 +40,7 @@ fn smoke_graph() -> Graph {
                     ]
                 }),
                 label: None,
+                comment: None,
             },
             Node {
                 id: NodeId("n_fn".into()),
@@ -55,6 +56,7 @@ fn smoke_graph() -> Graph {
                     "body": "crate::types::user::User { id, name }"
                 }),
                 label: None,
+                comment: None,
             },
         ],
         edges: Vec::<Edge>::new(),
@@ -266,6 +268,7 @@ async fn test_language_clone_edge_and_dataflow_inference() {
                     "name": "my_parser"
                 }),
                 label: None,
+                comment: None,
             },
             Node {
                 id: NodeId("n_clone".into()),
@@ -275,6 +278,7 @@ async fn test_language_clone_edge_and_dataflow_inference() {
                     "name": "my_clone"
                 }),
                 label: None,
+                comment: None,
             },
         ],
         edges: vec![
@@ -337,6 +341,7 @@ async fn test_language_tokio_spawn_dataflow_inference() {
                     "name": "my_parser"
                 }),
                 label: None,
+                comment: None,
             },
             Node {
                 id: NodeId("n_spawn".into()),
@@ -350,6 +355,7 @@ async fn test_language_tokio_spawn_dataflow_inference() {
                     "body": "let _ = my_parser_value.name;"
                 }),
                 label: None,
+                comment: None,
             },
             Node {
                 id: NodeId("n_spawn_blocking".into()),
@@ -364,6 +370,7 @@ async fn test_language_tokio_spawn_dataflow_inference() {
                     "return_type": "()"
                 }),
                 label: None,
+                comment: None,
             },
         ],
         edges: vec![
@@ -448,6 +455,7 @@ async fn test_adapters_emit_files_into_project_tree() {
                     "name": "my_cron"
                 }),
                 label: None,
+                comment: None,
             },
             Node {
                 id: NodeId("n_tail".into()),
@@ -459,6 +467,7 @@ async fn test_adapters_emit_files_into_project_tree() {
                     "name": "my_tail"
                 }),
                 label: None,
+                comment: None,
             },
             Node {
                 id: NodeId("n_webhook".into()),
@@ -470,6 +479,7 @@ async fn test_adapters_emit_files_into_project_tree() {
                     "name": "my_webhook"
                 }),
                 label: None,
+                comment: None,
             },
             Node {
                 id: NodeId("n_db".into()),
@@ -481,6 +491,7 @@ async fn test_adapters_emit_files_into_project_tree() {
                     "name": "my_db"
                 }),
                 label: None,
+                comment: None,
             },
         ],
         edges: vec![
@@ -562,6 +573,7 @@ async fn test_adapters_generated_project_compiles() {
                     "name": "my_cron"
                 }),
                 label: None,
+                comment: None,
             },
             Node {
                 id: NodeId("n_tail".into()),
@@ -573,6 +585,7 @@ async fn test_adapters_generated_project_compiles() {
                     "name": "my_tail"
                 }),
                 label: None,
+                comment: None,
             },
             Node {
                 id: NodeId("n_webhook".into()),
@@ -584,6 +597,7 @@ async fn test_adapters_generated_project_compiles() {
                     "name": "my_webhook"
                 }),
                 label: None,
+                comment: None,
             },
             Node {
                 id: NodeId("n_db".into()),
@@ -595,6 +609,7 @@ async fn test_adapters_generated_project_compiles() {
                     "name": "my_db"
                 }),
                 label: None,
+                comment: None,
             },
         ],
         edges: vec![
@@ -662,6 +677,7 @@ async fn test_custom_block_and_universal_connectors_emit_files() {
                     "code": "pub fn my_custom_fn(x: i32) -> i32 { x + 1 }"
                 }),
                 label: None,
+                comment: None,
             },
             Node {
                 id: NodeId("n_kafka_consumer".into()),
@@ -674,6 +690,7 @@ async fn test_custom_block_and_universal_connectors_emit_files() {
                     "name": "my_kafka_consumer"
                 }),
                 label: None,
+                comment: None,
             },
             Node {
                 id: NodeId("n_kafka_producer".into()),
@@ -685,6 +702,7 @@ async fn test_custom_block_and_universal_connectors_emit_files() {
                     "name": "my_kafka_producer"
                 }),
                 label: None,
+                comment: None,
             },
             Node {
                 id: NodeId("n_redis".into()),
@@ -696,6 +714,7 @@ async fn test_custom_block_and_universal_connectors_emit_files() {
                     "name": "my_redis"
                 }),
                 label: None,
+                comment: None,
             },
             Node {
                 id: NodeId("n_sql".into()),
@@ -707,6 +726,7 @@ async fn test_custom_block_and_universal_connectors_emit_files() {
                     "name": "my_sql"
                 }),
                 label: None,
+                comment: None,
             },
         ],
         edges: Vec::new(),
@@ -752,6 +772,7 @@ async fn test_cep_operators_pipeline_smoke() {
                     ]
                 }),
                 label: None,
+                comment: None,
             },
             Node {
                 id: NodeId("n_filter".into()),
@@ -764,6 +785,7 @@ async fn test_cep_operators_pipeline_smoke() {
                     "parallel": true
                 }),
                 label: None,
+                comment: None,
             },
             Node {
                 id: NodeId("n_map".into()),
@@ -777,6 +799,7 @@ async fn test_cep_operators_pipeline_smoke() {
                     "parallel": false
                 }),
                 label: None,
+                comment: None,
             },
             Node {
                 id: NodeId("n_select".into()),
@@ -788,6 +811,7 @@ async fn test_cep_operators_pipeline_smoke() {
                     "input_type": "crate::types::status_event::StatusEvent"
                 }),
                 label: None,
+                comment: None,
             },
             Node {
                 id: NodeId("n_union".into()),
@@ -798,6 +822,7 @@ async fn test_cep_operators_pipeline_smoke() {
                     "item_type": "crate::types::status_event::StatusEvent"
                 }),
                 label: None,
+                comment: None,
             },
             Node {
                 id: NodeId("n_join".into()),
@@ -812,6 +837,7 @@ async fn test_cep_operators_pipeline_smoke() {
                     "right_type": "crate::types::status_event::StatusEvent"
                 }),
                 label: None,
+                comment: None,
             },
             Node {
                 id: NodeId("n_window".into()),
@@ -827,6 +853,7 @@ async fn test_cep_operators_pipeline_smoke() {
                     "input_type": "crate::types::status_event::StatusEvent"
                 }),
                 label: None,
+                comment: None,
             },
             Node {
                 id: NodeId("n_pattern".into()),
@@ -840,6 +867,7 @@ async fn test_cep_operators_pipeline_smoke() {
                     "input_type": "crate::types::status_event::StatusEvent"
                 }),
                 label: None,
+                comment: None,
             },
         ],
         edges: vec![

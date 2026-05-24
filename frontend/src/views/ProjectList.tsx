@@ -5,6 +5,8 @@ import {
   deleteProject,
   listProjects,
   type ProjectMeta,
+  API_BASE,
+  importProject,
 } from "../api";
 
 // Quick client-side slug check matching the backend rules. This is purely
@@ -63,6 +65,87 @@ export default function ProjectList({ onOpen }: ProjectListProps): JSX.Element {
       createAbortRef.current?.abort();
     };
   }, []);
+
+  const [isDragging, setIsDragging] = useState(false);
+  const [importBusy, setImportBusy] = useState(false);
+  const [importErr, setImportErr] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  function triggerFileSelect(): void {
+    if (!importBusy) {
+      fileInputRef.current?.click();
+    }
+  }
+
+  function handleFileChange(e: React.ChangeEvent<HTMLInputElement>): void {
+    const file = e.target.files?.[0];
+    if (file) {
+      processImport(file);
+    }
+  }
+
+  function handleDragOver(e: React.DragEvent<HTMLDivElement>): void {
+    e.preventDefault();
+    if (!importBusy) {
+      setIsDragging(true);
+    }
+  }
+
+  function handleDragLeave(): void {
+    setIsDragging(false);
+  }
+
+  function handleDrop(e: React.DragEvent<HTMLDivElement>): void {
+    e.preventDefault();
+    setIsDragging(false);
+    if (importBusy) return;
+
+    const file = e.dataTransfer.files?.[0];
+    if (file) {
+      processImport(file);
+    }
+  }
+
+  function processImport(file: File): void {
+    if (!file.name.endsWith(".flow")) {
+      setImportErr("Only .flow files are supported");
+      return;
+    }
+    setImportErr(null);
+    setImportBusy(true);
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      const arrayBuffer = reader.result as ArrayBuffer;
+      importProject(arrayBuffer)
+        .then((newProject) => {
+          setRefreshTick((t) => t + 1);
+          onOpen(newProject.slug);
+        })
+        .catch((err: unknown) => {
+          const message = err instanceof ApiError ? err.message : "Import failed";
+          setImportErr(message);
+        })
+        .finally(() => {
+          setImportBusy(false);
+        });
+    };
+    reader.onerror = () => {
+      setImportErr("Failed to read file");
+      setImportBusy(false);
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
+  function handleExport(slug: string): void {
+    const url = `${API_BASE}/api/projects/${encodeURIComponent(slug)}/export`;
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${slug}.flow`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  }
 
   function handleCreate(e: React.FormEvent<HTMLFormElement>): void {
     e.preventDefault();
@@ -152,6 +235,29 @@ export default function ProjectList({ onOpen }: ProjectListProps): JSX.Element {
         {createErr && <p className="form-error">{createErr}</p>}
       </section>
 
+      <section className="project-import" style={{ marginTop: "2rem" }}>
+        <h2>Import Flow</h2>
+        <div
+          className={`import-dropzone ${isDragging ? "dragging" : ""} ${importBusy ? "busy" : ""}`}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
+          onClick={triggerFileSelect}
+        >
+          <input
+            type="file"
+            ref={fileInputRef}
+            onChange={handleFileChange}
+            style={{ display: "none" }}
+            accept=".flow"
+            disabled={importBusy}
+          />
+          <div className="import-icon">📥</div>
+          <p>{importBusy ? "Importing flow…" : "Drag & Drop .flow or click to upload"}</p>
+        </div>
+        {importErr && <p className="form-error" style={{ marginTop: "0.5rem" }}>{importErr}</p>}
+      </section>
+
       <section className="project-table-wrap">
         <h2>Projects</h2>
         {state.kind === "loading" && <p className="muted">loading…</p>}
@@ -179,6 +285,7 @@ export default function ProjectList({ onOpen }: ProjectListProps): JSX.Element {
                   <td className="muted">{p.updated_at.slice(0, 19).replace("T", " ")}</td>
                   <td className="row-actions">
                     <button type="button" onClick={() => onOpen(p.slug)}>open</button>
+                    <button type="button" onClick={() => handleExport(p.slug)}>export</button>
                     <button
                       type="button"
                       className="danger"

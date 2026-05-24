@@ -158,12 +158,7 @@ pub fn validate_graph(
         };
 
         // Source port existence on source template.
-        let source_template = registry.get(&source_node.template_id);
-        let source_port_spec = source_template.and_then(|t| {
-            t.output_ports()
-                .iter()
-                .find(|p| p.name == edge.source_port)
-        });
+        let source_port_spec = get_port_spec(source_node, registry, &edge.source_port, EdgeSide::Source);
         if source_port_spec.is_none() {
             errors.push(GraphValidationError::UnknownPort {
                 edge_id: edge.id.0.clone(),
@@ -174,12 +169,7 @@ pub fn validate_graph(
         }
 
         // Target port existence on target template.
-        let target_template = registry.get(&target_node.template_id);
-        let target_port_spec = target_template.and_then(|t| {
-            t.input_ports()
-                .iter()
-                .find(|p| p.name == edge.target_port)
-        });
+        let target_port_spec = get_port_spec(target_node, registry, &edge.target_port, EdgeSide::Target);
         if target_port_spec.is_none() {
             errors.push(GraphValidationError::UnknownPort {
                 edge_id: edge.id.0.clone(),
@@ -221,20 +211,7 @@ pub fn validate_graph(
             Some(n) => n,
             None => continue,
         };
-        let template = match registry.get(&node.template_id) {
-            Some(t) => t,
-            None => continue,
-        };
-        let port_spec = match side {
-            EdgeSide::Source => template
-                .output_ports()
-                .iter()
-                .find(|p| p.name == **port_name),
-            EdgeSide::Target => template
-                .input_ports()
-                .iter()
-                .find(|p| p.name == **port_name),
-        };
+        let port_spec = get_port_spec(node, registry, port_name, *side);
         let Some(spec) = port_spec else {
             continue;
         };
@@ -262,10 +239,54 @@ pub fn validate_graph(
     }
 }
 
-/// Two type tags are compatible if they are identical or either side is the
-/// wildcard `"any"`.
+/// Dynamic and static ports resolver for graph validation.
+fn get_port_spec(
+    node: &crate::projects::types::Node,
+    registry: &TemplateRegistry,
+    port_name: &str,
+    side: EdgeSide,
+) -> Option<crate::templates::ports::PortSpec> {
+    if node.template_id.as_str() == "custom.block" || node.template_id.as_str() == "grpc.server" {
+        let ports_key = match side {
+            EdgeSide::Source => "outputs",
+            EdgeSide::Target => "inputs",
+        };
+        if let Some(ports_val) = node.config.get(ports_key) {
+            if let Some(arr) = ports_val.as_array() {
+                for item in arr {
+                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let ty = item.get("ty").and_then(|v| v.as_str()).unwrap_or("any");
+                    if name == port_name {
+                        return Some(crate::templates::ports::PortSpec::single(name, ty, "Dynamic port"));
+                    }
+                }
+            }
+        }
+    }
+
+    let template = registry.get(&node.template_id)?;
+    let ports = match side {
+        EdgeSide::Source => template.output_ports(),
+        EdgeSide::Target => template.input_ports(),
+    };
+    ports.iter().find(|p| p.name == port_name).cloned()
+}
+
+/// Two type tags are compatible if they are identical, either side is the
+/// wildcard `"any"`, or one is a module path suffix of the other.
 fn type_tags_compatible(a: &str, b: &str) -> bool {
-    a == b || a == "any" || b == "any"
+    let clean_a = a.replace(' ', "");
+    let clean_b = b.replace(' ', "");
+    if clean_a == "any" || clean_b == "any" {
+        return true;
+    }
+    if clean_a == clean_b {
+        return true;
+    }
+    if clean_a.ends_with(&format!("::{}", clean_b)) || clean_b.ends_with(&format!("::{}", clean_a)) {
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -287,6 +308,7 @@ mod tests {
             position: Position { x: 0.0, y: 0.0 },
             config: serde_json::Value::Null,
             label: None,
+            comment: None,
         }
     }
 

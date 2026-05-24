@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::broadcast;
@@ -425,6 +424,7 @@ mod tests {
                     position: crate::projects::types::Position { x: 0.0, y: 0.0 },
                     config: json!({ "name": "getUserInfo" }),
                     label: None,
+                    comment: None,
                 },
                 Node {
                     id: NodeId("n2".to_string()),
@@ -432,6 +432,7 @@ mod tests {
                     position: crate::projects::types::Position { x: 0.0, y: 0.0 },
                     config: json!({ "name": "process_orders" }),
                     label: None,
+                    comment: None,
                 },
                 Node {
                     id: NodeId("n3".to_string()),
@@ -439,6 +440,7 @@ mod tests {
                     position: crate::projects::types::Position { x: 0.0, y: 0.0 },
                     config: json!({ "name": "PersonParser" }),
                     label: None,
+                    comment: None,
                 },
             ],
             edges: vec![],
@@ -572,6 +574,7 @@ edition = "2021"
         // Collect events until Exit.
         let mut saw_start = false;
         let mut saw_check_command = false;
+        #[allow(unused_assignments)]
         let mut exit_code = None;
 
         loop {
@@ -749,6 +752,7 @@ mod t {
             .expect("start_build with Test verb succeeds");
 
         let mut saw_test_command = false;
+        #[allow(unused_assignments)]
         let mut exit_code = None;
         loop {
             let event = timeout(Duration::from_secs(120), rx.recv())

@@ -39,6 +39,7 @@ pub mod tokio;
 pub mod connectors;
 pub mod stream;
 pub mod wasm;
+pub mod grpc;
 
 /// Register every built-in template into `registry`. Called once at startup
 /// from `TemplateRegistry::with_builtins`. Panics on duplicate id — that's
@@ -115,6 +116,10 @@ pub fn register_all(registry: &mut TemplateRegistry) {
 
     // S27 — WebAssembly runner
     reg!(wasm::WasmRunner::new());
+
+    // Milestone 4 — gRPC Server & Client
+    reg!(grpc::GrpcServer::new());
+    reg!(grpc::GrpcClient::new());
 }
 
 // ---- shared construction helper -------------------------------------------
@@ -1117,6 +1122,8 @@ mod tests {
                 "core.entry_point",
                 "core.service",
                 "custom.block",
+                "grpc.client",
+                "grpc.server",
                 "http.handler",
                 "http.route",
                 "integration.consumer.placeholder",
@@ -1162,10 +1169,11 @@ mod tests {
                 "tokio.sleep",
                 "tokio.spawn",
                 "tokio.spawn_blocking",
+                "wasm.runner",
             ],
             "expected exact set of builtin ids (sorted lexicographically by summaries())"
         );
-        assert_eq!(r.len(), 49);
+        assert_eq!(r.len(), 52);
     }
 
     #[test]
@@ -1240,6 +1248,7 @@ mod tests {
             position: crate::projects::types::Position { x: 0.0, y: 0.0 },
             config: serde_json::json!({"level": "info", "format": "pretty", "name": "request_logger"}),
             label: None,
+            comment: None,
         };
         let graph = crate::projects::types::Graph::default();
         let ctx = crate::templates::codegen::CodegenCtx {
@@ -1269,6 +1278,7 @@ mod tests {
             position: crate::projects::types::Position { x: 0.0, y: 0.0 },
             config: serde_json::json!({"name": "hello"}),
             label: None,
+            comment: None,
         };
         let graph = crate::projects::types::Graph::default();
         let ctx = crate::templates::codegen::CodegenCtx {
@@ -1297,6 +1307,7 @@ mod tests {
             position: crate::projects::types::Position { x: 0.0, y: 0.0 },
             config: serde_json::json!({"name": "get_user"}),
             label: None,
+            comment: None,
         };
         let handler_node = crate::projects::types::Node {
             id: crate::projects::types::NodeId("h1".into()),
@@ -1304,6 +1315,7 @@ mod tests {
             position: crate::projects::types::Position { x: 0.0, y: 0.0 },
             config: serde_json::json!({"name": "hello"}),
             label: None,
+            comment: None,
         };
         let graph = crate::projects::types::Graph {
             schema_version: crate::projects::types::GRAPH_SCHEMA_VERSION,
@@ -1343,6 +1355,7 @@ mod tests {
             position: crate::projects::types::Position { x: 0.0, y: 0.0 },
             config: serde_json::json!({"name": "User", "fields": [{"name": "id", "ty": "u64"}]}),
             label: None,
+            comment: None,
         };
         let svc_node = crate::projects::types::Node {
             id: crate::projects::types::NodeId("s1".into()),
@@ -1350,6 +1363,7 @@ mod tests {
             position: crate::projects::types::Position { x: 0.0, y: 0.0 },
             config: serde_json::json!({"name": "get_user"}),
             label: None,
+            comment: None,
         };
         let graph = crate::projects::types::Graph {
             schema_version: crate::projects::types::GRAPH_SCHEMA_VERSION,
@@ -1389,6 +1403,7 @@ mod tests {
             position: crate::projects::types::Position { x: 0.0, y: 0.0 },
             config: serde_json::json!({"name": "get_user"}),
             label: None,
+            comment: None,
         };
         let graph = crate::projects::types::Graph::default();
         let ctx = crate::templates::codegen::CodegenCtx {
@@ -1425,6 +1440,7 @@ mod tests {
             position: crate::projects::types::Position { x: 0.0, y: 0.0 },
             config: serde_json::json!({"schema_file": "person.json", "name": "person_parser"}),
             label: None,
+            comment: None,
         };
         let graph = crate::projects::types::Graph::default();
         let ctx = crate::templates::codegen::CodegenCtx {
@@ -1467,6 +1483,7 @@ message Person {
             position: crate::projects::types::Position { x: 0.0, y: 0.0 },
             config: serde_json::json!({"schema_file": "person.proto", "name": "person_parser"}),
             label: None,
+            comment: None,
         };
         let graph = crate::projects::types::Graph::default();
         let ctx = crate::templates::codegen::CodegenCtx {

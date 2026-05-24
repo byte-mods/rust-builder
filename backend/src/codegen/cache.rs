@@ -150,6 +150,7 @@ mod tests {
                 position: Position { x: 0.0, y: 0.0 },
                 config: serde_json::json!({"name": name, "fields": [{"name": "id", "ty": "u64"}]}),
                 label: None,
+                comment: None,
             }],
             edges: vec![],
         }

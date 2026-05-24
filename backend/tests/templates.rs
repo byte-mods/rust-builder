@@ -58,6 +58,8 @@ async fn test_list_templates_returns_expected_builtin_inventory_sorted() {
             "core.entry_point",
             "core.service",
             "custom.block",
+            "grpc.client",
+            "grpc.server",
             "http.handler",
             "http.route",
             "integration.consumer.placeholder",
@@ -103,6 +105,7 @@ async fn test_list_templates_returns_expected_builtin_inventory_sorted() {
             "tokio.sleep",
             "tokio.spawn",
             "tokio.spawn_blocking",
+            "wasm.runner",
         ],
         "templates must be returned in lexicographic id order"
     );

@@ -235,14 +235,19 @@ impl ProjectStore {
         // "first failure" the client sees corresponds to the first node
         // in the graph that breaks the contract.
         for node in &graph.nodes {
-            registry.validate(&node.template_id, &node.config)?;
+            if let Err(err) = registry.validate(&node.template_id, &node.config) {
+                tracing::error!("NODE VALIDATION FAILED on node '{}' ({}): {:?}", node.id.0, node.template_id.as_str(), err);
+                return Err(err.into());
+            }
         }
 
         // Validate graph structure — edges must reference real nodes and
         // declared ports, and type tags must be compatible.
         if let Err(errors) = crate::projects::validation::validate_graph(graph, registry) {
             let messages: Vec<String> = errors.iter().map(|e| e.message()).collect();
-            return Err(ApiError::InvalidGraph(messages.join("; ")));
+            let joined = messages.join("; ");
+            tracing::error!("GRAPH STRUCTURE VALIDATION FAILED: {}", joined);
+            return Err(ApiError::InvalidGraph(joined));
         }
 
         let dir = self.project_dir(slug);
@@ -278,6 +283,117 @@ impl ProjectStore {
         }
 
         Ok(())
+    }
+
+    /// Export a project as a serialized in-memory `.flow` (ZIP) archive.
+    pub async fn export_archive(&self, slug: &Slug) -> Result<Vec<u8>, ApiError> {
+        let dir = self.project_dir(slug);
+        
+        let project_bytes = fs::read(dir.join(PROJECT_FILE)).await.map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                ApiError::NotFound
+            } else {
+                err.into()
+            }
+        })?;
+        
+        let graph_bytes = fs::read(dir.join(GRAPH_FILE)).await.map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                ApiError::NotFound
+            } else {
+                err.into()
+            }
+        })?;
+
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let options = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+
+            zip.start_file(PROJECT_FILE, options)
+                .map_err(|e| ApiError::Internal(format!("Failed to create project.json in zip: {}", e)))?;
+            std::io::Write::write_all(&mut zip, &project_bytes)
+                .map_err(|e| ApiError::Internal(format!("Failed to write project.json in zip: {}", e)))?;
+
+            zip.start_file(GRAPH_FILE, options)
+                .map_err(|e| ApiError::Internal(format!("Failed to create graph.json in zip: {}", e)))?;
+            std::io::Write::write_all(&mut zip, &graph_bytes)
+                .map_err(|e| ApiError::Internal(format!("Failed to write graph.json in zip: {}", e)))?;
+
+            zip.finish()
+                .map_err(|e| ApiError::Internal(format!("Failed to finalize zip archive: {}", e)))?;
+        }
+
+        Ok(buf)
+    }
+
+    /// Import a project from a serialized `.flow` (ZIP) archive.
+    /// Resolves slug collisions by appending a sequential suffix (e.g. -import, -1)
+    /// and returns the newly saved (Project, Graph).
+    pub async fn import_archive(&self, zip_bytes: &[u8]) -> Result<(Project, Graph), ApiError> {
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes))
+            .map_err(|e| ApiError::InvalidBody(format!("Invalid zip archive: {}", e)))?;
+
+        let mut project_str = String::new();
+        {
+            let mut project_entry = archive.by_name(PROJECT_FILE)
+                .map_err(|_| ApiError::InvalidBody(format!("Missing {} inside flow archive", PROJECT_FILE)))?;
+            std::io::Read::read_to_string(&mut project_entry, &mut project_str)
+                .map_err(|e| ApiError::Internal(format!("Failed to read project.json from zip: {}", e)))?;
+        }
+        
+        let mut project: Project = serde_json::from_str(&project_str)
+            .map_err(|e| ApiError::InvalidBody(format!("Failed to parse project.json: {}", e)))?;
+
+        let mut graph_str = String::new();
+        {
+            let mut graph_entry = archive.by_name(GRAPH_FILE)
+                .map_err(|_| ApiError::InvalidBody(format!("Missing {} inside flow archive", GRAPH_FILE)))?;
+            std::io::Read::read_to_string(&mut graph_entry, &mut graph_str)
+                .map_err(|e| ApiError::Internal(format!("Failed to read graph.json from zip: {}", e)))?;
+        }
+        
+        let graph: Graph = serde_json::from_str(&graph_str)
+            .map_err(|e| ApiError::InvalidBody(format!("Failed to parse graph.json: {}", e)))?;
+
+        // Resolve slug collision
+        let original_slug = project.meta.slug.as_str().to_string();
+        let mut current_slug_str = original_slug.clone();
+        let mut suffix_counter = 0;
+
+        loop {
+            let candidate_slug = Slug::new(&current_slug_str);
+            match candidate_slug {
+                Ok(slug) => {
+                    let dir = self.project_dir(&slug);
+                    if !dir.exists() {
+                        project.meta.slug = slug;
+                        break;
+                    }
+                }
+                Err(_) => {}
+            }
+
+            suffix_counter += 1;
+            if suffix_counter == 1 {
+                current_slug_str = format!("{}-import", original_slug);
+            } else {
+                current_slug_str = format!("{}-{}", original_slug, suffix_counter - 1);
+            }
+        }
+
+        if suffix_counter > 0 {
+            project.meta.name = format!("{} (Imported)", project.meta.name);
+        }
+
+        let new_dir = self.project_dir(&project.meta.slug);
+        fs::create_dir_all(&new_dir).await?;
+
+        write_json_atomic(&new_dir.join(PROJECT_FILE), &project).await?;
+        write_json_atomic(&new_dir.join(GRAPH_FILE), &graph).await?;
+
+        Ok((project, graph))
     }
 }
 
@@ -559,5 +675,67 @@ mod tests {
         // Must deserialise cleanly (no torn JSON) and have exactly one node.
         let final_graph = store.load_graph(&slug("hot")).await.unwrap();
         assert_eq!(final_graph.nodes.len(), 1, "exactly one writer's state survives");
+    }
+
+    #[tokio::test]
+    async fn test_flow_export_and_import_roundtrip() {
+        let dir = tempdir().unwrap();
+        let store = ProjectStore::new(dir.path()).await.unwrap();
+        
+        let slug_name = slug("export-test");
+        store.create(slug_name.clone(), "Export Test".into()).await.unwrap();
+
+        // Save some graph nodes
+        let mut g = Graph::default();
+        g.nodes.push(crate::projects::types::Node {
+            id: crate::projects::types::NodeId("node_1".into()),
+            template_id: crate::templates::TemplateId::new("core.entry_point").unwrap(),
+            position: crate::projects::types::Position { x: 100.0, y: 100.0 },
+            config: serde_json::json!({}),
+            label: Some("Start".into()),
+            comment: Some("Initial Entry Point".into()),
+        });
+        
+        let reg = registry();
+        store.save_graph(&slug_name, &g, &reg).await.unwrap();
+
+        // Export archive
+        let zip_bytes = store.export_archive(&slug_name).await.unwrap();
+        assert!(!zip_bytes.is_empty(), "Exported zip should not be empty");
+
+        // Import it in another fresh store
+        let dir2 = tempdir().unwrap();
+        let store2 = ProjectStore::new(dir2.path()).await.unwrap();
+        let (imported_proj, imported_graph) = store2.import_archive(&zip_bytes).await.unwrap();
+
+        assert_eq!(imported_proj.meta.slug.as_str(), "export-test");
+        assert_eq!(imported_proj.meta.name, "Export Test");
+        assert_eq!(imported_graph.nodes.len(), 1);
+        assert_eq!(imported_graph.nodes[0].id.0, "node_1");
+        assert_eq!(imported_graph.nodes[0].comment.as_deref(), Some("Initial Entry Point"));
+    }
+
+    #[tokio::test]
+    async fn test_flow_import_slug_collision_resolution() {
+        let dir = tempdir().unwrap();
+        let store = ProjectStore::new(dir.path()).await.unwrap();
+        
+        let slug_name = slug("collision");
+        store.create(slug_name.clone(), "Original".into()).await.unwrap();
+
+        // Export a flow package of the first project
+        let zip_bytes = store.export_archive(&slug_name).await.unwrap();
+
+        // Import it back into the same store! This should collide with "collision"
+        let (imported_proj, _) = store.import_archive(&zip_bytes).await.unwrap();
+
+        // First collision appends "-import"
+        assert_eq!(imported_proj.meta.slug.as_str(), "collision-import");
+        assert_eq!(imported_proj.meta.name, "Original (Imported)");
+
+        // Import it again! This should collide with both "collision" and "collision-import", appending "-1"
+        let (imported_proj2, _) = store.import_archive(&zip_bytes).await.unwrap();
+        assert_eq!(imported_proj2.meta.slug.as_str(), "collision-1");
+        assert_eq!(imported_proj2.meta.name, "Original (Imported)");
     }
 }

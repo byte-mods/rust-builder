@@ -4,11 +4,23 @@ _Single source of truth for in-flight work. Updated by the agent before starting
 
 ## In progress
 
-_None. All active roadmap focus areas for this session are successfully completed!_
+- [Section 1 — Type inference across edges] — started 2026-05-24T00:50:00+05:30
+  - [T1] codegen::types module + TypeResolver + ResolvedType + PortSide — completed 2026-05-24T01:05:00+05:30 — super-qa PASS, 7 new tests, full lib suite green (255 passed), 2 non-blocking MINORs noted.
 
 ## Queued
 
-_None. Ready for the next focus area._
+- [Section 2 — S19 Visual Test Runner]
+- [Section 3 — S17 Framework Deep Customization drawer (middleware, CORS, rate-limit, hooks)]
+- [Section 4 — S20 Auto-fix suggestions]
+- [Section 5 — Connector pack: messaging family (Redis Pub/Sub, NATS, RabbitMQ, Pulsar)]
+- [Section 6 — Connector pack: databases family (MongoDB, Scylla/Cassandra, ClickHouse, DynamoDB, MySQL writer)]
+- [Section 7 — Connector pack: search & storage (Elasticsearch, Meilisearch, S3, Memcached, File/CSV writer, WebSocket server, UDP/TCP, CDC)]
+- [Section 8 — Streaming gaps (Session/Delta/Punctuation windows, Absence + Aggregation-over-pattern + Sliding-pattern, watermarks/event-time)]
+- [Section 9 — Observability (Prometheus metrics, /health probes, OpenTelemetry, alerting hooks)]
+- [Section 10 — Deployment (Dockerfile gen, K8s manifest gen, env/secret management)]
+- [Section 11 — Type-system extras (XML schema, FlatBuffers/Cap'n Proto, schema registry)]
+- [Section 12 — S11 Claude CLI per-project chat]
+- [Section 13 — S14 Final polish + demo flow]
 
 ## Completed (this session)
 

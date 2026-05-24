@@ -50,6 +50,9 @@ pub fn projects_router() -> Router<AppState> {
         .route("/projects/:slug/llm/generate-flow", post(generate_flow))
         .route("/projects/:slug/llm/refine-flow", post(refine_flow))
         .route("/projects/:slug/audit", post(audit_project))
+        .route("/projects/:slug/export", get(export_project))
+        .route("/projects/import", post(import_project))
+        .route("/projects/:slug/db/schema", post(db_schema))
 }
 
 /// Request body for `POST /api/projects`. `slug` deserialises through the
@@ -159,6 +162,22 @@ async fn put_graph(
                         }
                         Err(e) => {
                             return Err(ApiError::InvalidGraph(format!("Custom block '{}' code parsing failed: {}", node.id.0, e)));
+                        }
+                    }
+                }
+            }
+        } else if node.template_id.as_str() == "grpc.server" {
+            if let Some(proto_val) = node.config.get("proto_definition") {
+                if let Some(proto_str) = proto_val.as_str() {
+                    match crate::templates::builtins::grpc::parse_proto_ports(proto_str) {
+                        Ok((inputs, outputs)) => {
+                            if let serde_json::Value::Object(ref mut map) = node.config {
+                                map.insert("inputs".to_string(), serde_json::to_value(inputs).unwrap());
+                                map.insert("outputs".to_string(), serde_json::to_value(outputs).unwrap());
+                            }
+                        }
+                        Err(e) => {
+                            return Err(ApiError::InvalidGraph(format!("gRPC Server '{}' Proto3 schema parsing failed: {}", node.id.0, e)));
                         }
                     }
                 }
@@ -387,15 +406,21 @@ fn parse_slug(raw: &str) -> Result<Slug, ApiError> {
 struct GenerateFlowBody {
     prompt: String,
     history: Option<Vec<llm::ChatMessage>>,
+    provider: Option<llm::LlmProvider>,
+    api_key: Option<String>,
+    model: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RefineFlowBody {
     prompt: String,
     history: Option<Vec<llm::ChatMessage>>,
+    provider: Option<llm::LlmProvider>,
+    api_key: Option<String>,
+    model: Option<String>,
 }
 
-/// `POST /api/projects/:slug/llm/generate-flow` — generate a proposed flow graph using Anthropic Claude.
+/// `POST /api/projects/:slug/llm/generate-flow` — generate a proposed flow graph using the selected LLM provider.
 async fn generate_flow(
     State(state): State<AppState>,
     Path(slug): Path<String>,
@@ -405,10 +430,50 @@ async fn generate_flow(
     let _ = state.store.load(&slug).await?;
     let Json(body) = body?;
 
-    let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| ApiError::ApiKeyMissing)?;
-    if api_key.trim().is_empty() {
-        return Err(ApiError::ApiKeyMissing);
-    }
+    let provider = body.provider.unwrap_or_else(|| {
+        if std::env::var("OPENAI_API_KEY").is_ok() {
+            llm::LlmProvider::OpenAi
+        } else if std::env::var("DEEPSEEK_API_KEY").is_ok() {
+            llm::LlmProvider::DeepSeek
+        } else if std::env::var("KIMI_API_KEY").is_ok() {
+            llm::LlmProvider::Kimi
+        } else {
+            llm::LlmProvider::Anthropic
+        }
+    });
+
+    let resolved_key = match body.api_key.as_deref() {
+        Some(k) if !k.trim().is_empty() => Some(k.to_string()),
+        _ => {
+            let env_key = match provider {
+                llm::LlmProvider::Anthropic => "ANTHROPIC_API_KEY",
+                llm::LlmProvider::OpenAi => "OPENAI_API_KEY",
+                llm::LlmProvider::Codex => "CODEX_API_KEY",
+                llm::LlmProvider::DeepSeek => "DEEPSEEK_API_KEY",
+                llm::LlmProvider::Kimi => "KIMI_API_KEY",
+                llm::LlmProvider::ClaudeCli => "",
+            };
+            if !env_key.is_empty() {
+                let val = std::env::var(env_key).map_err(|_| {
+                    if provider == llm::LlmProvider::Anthropic {
+                        ApiError::ApiKeyMissing
+                    } else {
+                        ApiError::LlmError(format!("API key environment variable `{env_key}` is not set"))
+                    }
+                })?;
+                if val.trim().is_empty() {
+                    return Err(if provider == llm::LlmProvider::Anthropic {
+                        ApiError::ApiKeyMissing
+                    } else {
+                        ApiError::LlmError(format!("API key environment variable `{env_key}` is empty"))
+                    });
+                }
+                Some(val)
+            } else {
+                None
+            }
+        }
+    };
 
     let project_dir = state.store.root().join(slug.as_str());
     let current_graph = state.store.load_graph(&slug).await?;
@@ -422,13 +487,22 @@ async fn generate_flow(
     );
 
     let history_ref = body.history.as_deref();
-    let proposed_graph = llm::call_anthropic_api(&api_key, &system_prompt, &user_prompt, history_ref).await?;
+    let proposed_graph = llm::call_llm_api(
+        provider,
+        resolved_key.as_deref(),
+        body.model.as_deref(),
+        &system_prompt,
+        &user_prompt,
+        history_ref,
+    )
+    .await?;
+
     llm::validate_proposed_graph(&proposed_graph, &state.registry)?;
 
     Ok(Json(proposed_graph))
 }
 
-/// `POST /api/projects/:slug/llm/refine-flow` — refine the existing flow graph using Anthropic Claude.
+/// `POST /api/projects/:slug/llm/refine-flow` — refine the existing flow graph using the selected LLM provider.
 async fn refine_flow(
     State(state): State<AppState>,
     Path(slug): Path<String>,
@@ -438,10 +512,50 @@ async fn refine_flow(
     let _ = state.store.load(&slug).await?;
     let Json(body) = body?;
 
-    let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| ApiError::ApiKeyMissing)?;
-    if api_key.trim().is_empty() {
-        return Err(ApiError::ApiKeyMissing);
-    }
+    let provider = body.provider.unwrap_or_else(|| {
+        if std::env::var("OPENAI_API_KEY").is_ok() {
+            llm::LlmProvider::OpenAi
+        } else if std::env::var("DEEPSEEK_API_KEY").is_ok() {
+            llm::LlmProvider::DeepSeek
+        } else if std::env::var("KIMI_API_KEY").is_ok() {
+            llm::LlmProvider::Kimi
+        } else {
+            llm::LlmProvider::Anthropic
+        }
+    });
+
+    let resolved_key = match body.api_key.as_deref() {
+        Some(k) if !k.trim().is_empty() => Some(k.to_string()),
+        _ => {
+            let env_key = match provider {
+                llm::LlmProvider::Anthropic => "ANTHROPIC_API_KEY",
+                llm::LlmProvider::OpenAi => "OPENAI_API_KEY",
+                llm::LlmProvider::Codex => "CODEX_API_KEY",
+                llm::LlmProvider::DeepSeek => "DEEPSEEK_API_KEY",
+                llm::LlmProvider::Kimi => "KIMI_API_KEY",
+                llm::LlmProvider::ClaudeCli => "",
+            };
+            if !env_key.is_empty() {
+                let val = std::env::var(env_key).map_err(|_| {
+                    if provider == llm::LlmProvider::Anthropic {
+                        ApiError::ApiKeyMissing
+                    } else {
+                        ApiError::LlmError(format!("API key environment variable `{env_key}` is not set"))
+                    }
+                })?;
+                if val.trim().is_empty() {
+                    return Err(if provider == llm::LlmProvider::Anthropic {
+                        ApiError::ApiKeyMissing
+                    } else {
+                        ApiError::LlmError(format!("API key environment variable `{env_key}` is empty"))
+                    });
+                }
+                Some(val)
+            } else {
+                None
+            }
+        }
+    };
 
     let project_dir = state.store.root().join(slug.as_str());
     let current_graph = state.store.load_graph(&slug).await?;
@@ -455,7 +569,16 @@ async fn refine_flow(
     );
 
     let history_ref = body.history.as_deref();
-    let proposed_graph = llm::call_anthropic_api(&api_key, &system_prompt, &user_prompt, history_ref).await?;
+    let proposed_graph = llm::call_llm_api(
+        provider,
+        resolved_key.as_deref(),
+        body.model.as_deref(),
+        &system_prompt,
+        &user_prompt,
+        history_ref,
+    )
+    .await?;
+
     llm::validate_proposed_graph(&proposed_graph, &state.registry)?;
 
     Ok(Json(proposed_graph))
@@ -477,4 +600,61 @@ async fn audit_project(
 
     Ok(Json(report))
 }
+
+/// `GET /api/projects/:slug/export` — export project files compressed inside a portable `.flow` archive.
+async fn export_project(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+) -> Result<impl axum::response::IntoResponse, ApiError> {
+    let slug = parse_slug(&slug)?;
+    let archive_bytes = state.store.export_archive(&slug).await?;
+    
+    let filename = format!("{}.flow", slug.as_str());
+    
+    let response = axum::response::Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
+        .header(
+            axum::http::header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}\"", filename),
+        )
+        .body(axum::body::Body::from(archive_bytes))
+        .map_err(|e| ApiError::Internal(format!("Failed to build response: {}", e)))?;
+        
+    Ok(response)
+}
+
+/// `POST /api/projects/import` — import a portable `.flow` archive and regenerate the target's Rust source codes.
+async fn import_project(
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> Result<Json<Project>, ApiError> {
+    let (project, graph) = state.store.import_archive(&body).await?;
+    
+    let generator = Generator::new(
+        Arc::clone(&state.registry),
+        state.store.root().to_path_buf(),
+    );
+    let _report = generator.generate_project(&project.meta.slug, &graph).await?;
+    
+    Ok(Json(project))
+}
+
+#[derive(Debug, Deserialize)]
+struct DbSchemaBody {
+    connection_string: String,
+}
+
+/// `POST /api/projects/:slug/db/schema` — introspect and explore table schemas and foreign key relations.
+async fn db_schema(
+    State(_state): State<AppState>,
+    Path(slug): Path<String>,
+    body: Result<Json<DbSchemaBody>, JsonRejection>,
+) -> Result<Json<crate::projects::db::DbSchemaReport>, ApiError> {
+    let _slug = parse_slug(&slug)?;
+    let Json(body) = body?;
+    let report = crate::projects::db::introspect_schema(&body.connection_string).await?;
+    Ok(Json(report))
+}
+
+
 

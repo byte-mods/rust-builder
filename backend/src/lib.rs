@@ -43,6 +43,7 @@ pub struct AppState {
     /// `regen_if_changed` to skip codegen when the graph hasn't changed
     /// since the last click.
     pub codegen_cache: CodegenCache,
+    pub collab_manager: Arc<crate::projects::CollabManager>,
 }
 
 impl AppState {
@@ -53,6 +54,7 @@ impl AppState {
             build_manager: Arc::new(crate::build::BuildManager::new()),
             run_manager: Arc::new(RunManager::new()),
             codegen_cache: CodegenCache::new(),
+            collab_manager: Arc::new(crate::projects::CollabManager::new()),
         }
     }
 }
@@ -89,6 +91,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/ws/build/:slug", get(build::build_ws))
         .route("/ws/run/:slug", get(run::run_ws))
+        .route("/ws/collab/:slug", get(projects::collab_ws))
         .nest("/api", projects::projects_router())
         .nest("/api", templates::templates_router())
         .layer(TraceLayer::new_for_http())

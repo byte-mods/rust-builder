@@ -48,6 +48,7 @@ pub mod dataflow;
 pub mod files;
 pub mod format;
 pub mod regions;
+pub mod types;
 
 pub use cache::{CodegenCache, RegenOutcome};
 
@@ -235,7 +236,10 @@ impl Generator {
                         }
                         let replaced_src = dataflow::replace_placeholders(&item.source, &dataflow);
                         let debug_kind = template.debug_bridge();
-                        let final_src = if debug_kind != crate::templates::DebugBridgeKind::PassThrough {
+                        let final_src = if debug_kind != crate::templates::DebugBridgeKind::PassThrough
+                            && item.module_path.ends_with(".rs")
+                            && !item.module_path.contains("..")
+                        {
                             match instrument_source(&replaced_src, &node.id.0, template_id.as_str()) {
                                 Ok(src) => src,
                                 Err(e) => {
@@ -249,28 +253,37 @@ impl Generator {
                         } else {
                             replaced_src
                         };
-                        let formatted = format::validate_and_format(
-                            &final_src,
-                            template_id.as_str(),
-                            &node.id.0,
-                        )?;
+                        let (formatted, is_rs) = if item.module_path.ends_with(".rs") {
+                            let f = format::validate_and_format(
+                                &final_src,
+                                template_id.as_str(),
+                                &node.id.0,
+                            )?;
+                            (f, true)
+                        } else {
+                            (final_src, false)
+                        };
                         let target = src_dir.join(&item.module_path);
                         let changed = files::write_atomic_if_changed(&target, &formatted).await?;
                         if changed {
                             report.files_written.push(format!("src/{}", item.module_path));
                         }
-                        if let Some((dir, file)) = item.module_path.rsplit_once('/') {
-                            let name = file.trim_end_matches(".rs");
-                            dir_mods.entry(dir.to_string()).or_default().push(name.to_string());
+                        if is_rs && !item.module_path.contains("..") {
+                            if let Some((dir, file)) = item.module_path.rsplit_once('/') {
+                                let name = file.trim_end_matches(".rs");
+                                dir_mods.entry(dir.to_string()).or_default().push(name.to_string());
+                            }
                         }
                     }
                     if template.debug_bridge() == crate::templates::DebugBridgeKind::LongRunner {
                         for item in &emission.items {
-                            if let Some((dir, file)) = item.module_path.rsplit_once('/') {
-                                let name = file.trim_end_matches(".rs");
-                                let crate_name = slug.as_str().replace('-', "_");
-                                let expr = format!("{}::{}::{}::run()", crate_name, dir.replace('/', "::"), name);
-                                spawn_tasks.push((name.to_string(), expr));
+                            if item.module_path.ends_with(".rs") && !item.module_path.contains("..") {
+                                if let Some((dir, file)) = item.module_path.rsplit_once('/') {
+                                    let name = file.trim_end_matches(".rs");
+                                    let crate_name = slug.as_str().replace('-', "_");
+                                    let expr = format!("{}::{}::{}::run()", crate_name, dir.replace('/', "::"), name);
+                                    spawn_tasks.push((name.to_string(), expr));
+                                }
                             }
                         }
                     }
@@ -291,19 +304,26 @@ impl Generator {
                             });
                         }
                         let replaced_src = dataflow::replace_placeholders(&item.source, &dataflow);
-                        let formatted = format::validate_and_format(
-                            &replaced_src,
-                            template_id.as_str(),
-                            &node.id.0,
-                        )?;
+                        let (formatted, is_rs) = if item.module_path.ends_with(".rs") {
+                            let f = format::validate_and_format(
+                                &replaced_src,
+                                template_id.as_str(),
+                                &node.id.0,
+                            )?;
+                            (f, true)
+                        } else {
+                            (replaced_src, false)
+                        };
                         let target = src_dir.join(&item.module_path);
                         let changed = files::write_atomic_if_changed(&target, &formatted).await?;
                         if changed {
                             report.files_written.push(format!("src/{}", item.module_path));
                         }
-                        if let Some((dir, file)) = item.module_path.rsplit_once('/') {
-                            let name = file.trim_end_matches(".rs");
-                            dir_mods.entry(dir.to_string()).or_default().push(name.to_string());
+                        if is_rs && !item.module_path.contains("..") {
+                            if let Some((dir, file)) = item.module_path.rsplit_once('/') {
+                                        let name = file.trim_end_matches(".rs");
+                                dir_mods.entry(dir.to_string()).or_default().push(name.to_string());
+                            }
                         }
                     }
                     all_deps.extend(schema_emission.dependencies);
@@ -578,6 +598,7 @@ mod tests {
                     position: crate::projects::types::Position { x: 0.0, y: 0.0 },
                     config: serde_json::json!({"name": "User", "fields": [{"name": "id", "ty": "u64"}]}),
                     label: None,
+                    comment: None,
                 },
                 crate::projects::types::Node {
                     id: crate::projects::types::NodeId("n2".into()),
@@ -585,6 +606,7 @@ mod tests {
                     position: crate::projects::types::Position { x: 0.0, y: 0.0 },
                     config: serde_json::json!({"name": "get_user"}),
                     label: None,
+                    comment: None,
                 },
                 crate::projects::types::Node {
                     id: crate::projects::types::NodeId("n3".into()),
@@ -592,6 +614,7 @@ mod tests {
                     position: crate::projects::types::Position { x: 0.0, y: 0.0 },
                     config: serde_json::json!({"name": "hello"}),
                     label: None,
+                    comment: None,
                 },
                 crate::projects::types::Node {
                     id: crate::projects::types::NodeId("n4".into()),
@@ -599,6 +622,7 @@ mod tests {
                     position: crate::projects::types::Position { x: 0.0, y: 0.0 },
                     config: serde_json::json!({"path": "/hello", "method": "GET"}),
                     label: None,
+                    comment: None,
                 },
             ],
             edges: vec![
@@ -655,6 +679,7 @@ mod tests {
                     position: crate::projects::types::Position { x: 0.0, y: 0.0 },
                     config: serde_json::json!({"topic": "orders", "group": "g1", "name": "orders_consumer"}),
                     label: None,
+                    comment: None,
                 },
                 crate::projects::types::Node {
                     id: crate::projects::types::NodeId("n2".into()),
@@ -662,6 +687,7 @@ mod tests {
                     position: crate::projects::types::Position { x: 0.0, y: 0.0 },
                     config: serde_json::json!({"cron": "0 9 * * *", "name": "morning"}),
                     label: None,
+                    comment: None,
                 },
             ],
             edges: vec![],
@@ -710,6 +736,7 @@ mod tests {
                     position: crate::projects::types::Position { x: 0.0, y: 0.0 },
                     config: serde_json::json!({"name": "User", "fields": [{"name": "id", "ty": "u64"}]}),
                     label: None,
+                    comment: None,
                 },
                 crate::projects::types::Node {
                     id: crate::projects::types::NodeId("n2".into()),
@@ -717,6 +744,7 @@ mod tests {
                     position: crate::projects::types::Position { x: 0.0, y: 0.0 },
                     config: serde_json::json!({"name": "get_user"}),
                     label: None,
+                    comment: None,
                 },
                 crate::projects::types::Node {
                     id: crate::projects::types::NodeId("n3".into()),
@@ -724,6 +752,7 @@ mod tests {
                     position: crate::projects::types::Position { x: 0.0, y: 0.0 },
                     config: serde_json::json!({"name": "hello"}),
                     label: None,
+                    comment: None,
                 },
                 crate::projects::types::Node {
                     id: crate::projects::types::NodeId("n4".into()),
@@ -731,6 +760,7 @@ mod tests {
                     position: crate::projects::types::Position { x: 0.0, y: 0.0 },
                     config: serde_json::json!({"path": "/hello", "method": "GET"}),
                     label: None,
+                    comment: None,
                 },
             ],
             edges: vec![
@@ -847,6 +877,7 @@ mod tests {
                     position: crate::projects::types::Position { x: 0.0, y: 0.0 },
                     config: serde_json::json!({}),
                     label: None,
+                    comment: None,
                 },
             ],
             edges: vec![],
@@ -877,6 +908,7 @@ mod tests {
                     position: crate::projects::types::Position { x: 0.0, y: 0.0 },
                     config: serde_json::json!({"name": "User", "fields": [{"name": "id", "ty": "u64"}]}),
                     label: None,
+                    comment: None,
                 },
                 crate::projects::types::Node {
                     id: crate::projects::types::NodeId("n2".into()),
@@ -884,6 +916,7 @@ mod tests {
                     position: crate::projects::types::Position { x: 0.0, y: 0.0 },
                     config: serde_json::json!({"name": "get_user"}),
                     label: None,
+                    comment: None,
                 },
                 crate::projects::types::Node {
                     id: crate::projects::types::NodeId("n3".into()),
@@ -891,6 +924,7 @@ mod tests {
                     position: crate::projects::types::Position { x: 0.0, y: 0.0 },
                     config: serde_json::json!({"name": "hello"}),
                     label: None,
+                    comment: None,
                 },
                 crate::projects::types::Node {
                     id: crate::projects::types::NodeId("n4".into()),
@@ -898,6 +932,7 @@ mod tests {
                     position: crate::projects::types::Position { x: 0.0, y: 0.0 },
                     config: serde_json::json!({"path": "/hello", "method": "GET"}),
                     label: None,
+                    comment: None,
                 },
             ],
             edges: vec![
@@ -990,6 +1025,7 @@ message Person {
                     position: crate::projects::types::Position { x: 0.0, y: 0.0 },
                     config: serde_json::json!({"schema_file": "person.json", "name": "person_json"}),
                     label: None,
+                    comment: None,
                 },
                 crate::projects::types::Node {
                     id: crate::projects::types::NodeId("p2".into()),
@@ -997,6 +1033,7 @@ message Person {
                     position: crate::projects::types::Position { x: 0.0, y: 0.0 },
                     config: serde_json::json!({"schema_file": "person.proto", "name": "person_proto"}),
                     label: None,
+                    comment: None,
                 },
             ],
             edges: vec![],
@@ -1060,6 +1097,7 @@ message Person {
                     position: crate::projects::types::Position { x: 0.0, y: 0.0 },
                     config: serde_json::json!({"schema_file": "person.json", "name": "person_json"}),
                     label: None,
+                    comment: None,
                 },
                 crate::projects::types::Node {
                     id: crate::projects::types::NodeId("p2".into()),
@@ -1067,6 +1105,7 @@ message Person {
                     position: crate::projects::types::Position { x: 0.0, y: 0.0 },
                     config: serde_json::json!({"schema_file": "person.proto", "name": "person_proto"}),
                     label: None,
+                    comment: None,
                 },
             ],
             edges: vec![],

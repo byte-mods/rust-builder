@@ -1206,6 +1206,7 @@ mod tests {
             position: Position { x: 0.0, y: 0.0 },
             config,
             label: None,
+            comment: None,
         };
         let graph = Graph {
             schema_version: GRAPH_SCHEMA_VERSION,

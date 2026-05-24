@@ -12,6 +12,10 @@ pub mod types;
 pub mod validation;
 pub mod llm;
 pub mod security;
+pub mod db;
+pub mod collab;
+
+pub use collab::{collab_ws, CollabManager};
 
 pub use handlers::projects_router;
 pub use store::ProjectStore;
