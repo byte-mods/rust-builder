@@ -2317,6 +2317,12 @@ pub(super) struct LanguageIfElseConfig {
     pub(super) true_expr: String,
     /// Expression returned when the condition is false.
     pub(super) false_expr: String,
+    /// Optional parameter type (defaults to "impl Clone")
+    #[serde(default)]
+    pub(super) input_type: Option<String>,
+    /// Optional return type (defaults to "impl Clone")
+    #[serde(default)]
+    pub(super) return_type: Option<String>,
 }
 
 pub struct LanguageIfElse {
@@ -2373,16 +2379,19 @@ impl NodeTemplate for LanguageIfElse {
         let upstream_edge = ctx.graph.edges.iter()
             .find(|e| e.target == ctx.node.id && e.target_port == "input");
 
+        let input_ty = config.input_type.as_deref().unwrap_or("impl Clone");
+        let return_ty = config.return_type.as_deref().unwrap_or("impl Clone");
+
         let source = if let Some(edge) = upstream_edge {
             let up_var = crate::codegen::dataflow::get_value_var_name(&edge.source, &edge.source_port, ctx.graph);
             format!(
-                "pub fn {}({}: impl Clone) -> impl Clone {{\n    if {} {{\n        {}\n    }} else {{\n        {}\n    }}\n}}\n",
-                config.name, up_var, config.condition, config.true_expr, config.false_expr
+                "pub fn {}({}: {}) -> {} {{\n    if {} {{\n        {}\n    }} else {{\n        {}\n    }}\n}}\n",
+                config.name, up_var, input_ty, return_ty, config.condition, config.true_expr, config.false_expr
             )
         } else {
             format!(
-                "pub fn {}() -> impl Clone {{\n    if {} {{\n        {}\n    }} else {{\n        {}\n    }}\n}}\n",
-                config.name, config.condition, config.true_expr, config.false_expr
+                "pub fn {}() -> {} {{\n    if {} {{\n        {}\n    }} else {{\n        {}\n    }}\n}}\n",
+                config.name, return_ty, config.condition, config.true_expr, config.false_expr
             )
         };
 

@@ -33,6 +33,17 @@ pub const GRAPH_SCHEMA_VERSION: u32 = 1;
 const SLUG_MIN_LEN: usize = 2;
 const SLUG_MAX_LEN: usize = 40;
 
+/// Package slug length bounds. Same shape as project slugs — packages also
+/// become filesystem directories under `projects/<slug>/packages/<pkg>/`, so
+/// the same FS-safety rules apply.
+const PACKAGE_SLUG_MIN_LEN: usize = 2;
+const PACKAGE_SLUG_MAX_LEN: usize = 40;
+
+/// Slug of the synthesised root package when a legacy single-graph
+/// `project.json` is loaded. Stable identifier — never rename: every
+/// pre-Section-1 project on disk relies on this exact value to migrate.
+pub const ROOT_PACKAGE_SLUG: &str = "main";
+
 // Windows reserved device names. Even on Unix we reject these as project
 // slugs so a project folder copied to a Windows host (e.g. via git on a
 // shared filesystem) does not fail to open. Cheap, defense in depth.
@@ -80,33 +91,7 @@ impl Slug {
     ///    multibyte UTF-8 — is rejected at the byte that violates the rule.
     /// 5. The lowercased candidate is not in [`RESERVED_NAMES`].
     pub fn new(raw: &str) -> Result<Self, SlugError> {
-        let bytes = raw.as_bytes();
-        let len = bytes.len();
-        if !(SLUG_MIN_LEN..=SLUG_MAX_LEN).contains(&len) {
-            return Err(SlugError::Length(len));
-        }
-
-        let first = bytes[0];
-        if !first.is_ascii_lowercase() {
-            return Err(SlugError::BadStart);
-        }
-
-        let last = bytes[len - 1];
-        if !(last.is_ascii_lowercase() || last.is_ascii_digit()) {
-            return Err(SlugError::BadEnd);
-        }
-
-        for (i, &b) in bytes.iter().enumerate() {
-            let allowed = b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-';
-            if !allowed {
-                return Err(SlugError::BadChar(i));
-            }
-        }
-
-        if RESERVED_NAMES.contains(&raw) {
-            return Err(SlugError::Reserved);
-        }
-
+        validate_slug_chars(raw, SLUG_MIN_LEN, SLUG_MAX_LEN)?;
         Ok(Slug(raw.to_owned()))
     }
 
@@ -115,6 +100,49 @@ impl Slug {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// Shared FS-safety validator for slug-shaped identifiers. Both [`Slug`]
+/// (project names) and [`PackageSlug`] (package names inside a project)
+/// route through this function so the rules cannot drift between the two
+/// types — every byte that reaches the filesystem has cleared the same
+/// gate.
+///
+/// Rules (enforced in order):
+/// 1. Length in `[min, max]`.
+/// 2. First byte `[a-z]`.
+/// 3. Last byte `[a-z0-9]`.
+/// 4. Every interior byte `[a-z0-9-]`.
+/// 5. Lowercased value not in [`RESERVED_NAMES`] (Windows device names).
+fn validate_slug_chars(raw: &str, min: usize, max: usize) -> Result<(), SlugError> {
+    let bytes = raw.as_bytes();
+    let len = bytes.len();
+    if !(min..=max).contains(&len) {
+        return Err(SlugError::Length(len));
+    }
+
+    let first = bytes[0];
+    if !first.is_ascii_lowercase() {
+        return Err(SlugError::BadStart);
+    }
+
+    let last = bytes[len - 1];
+    if !(last.is_ascii_lowercase() || last.is_ascii_digit()) {
+        return Err(SlugError::BadEnd);
+    }
+
+    for (i, &b) in bytes.iter().enumerate() {
+        let allowed = b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-';
+        if !allowed {
+            return Err(SlugError::BadChar(i));
+        }
+    }
+
+    if RESERVED_NAMES.contains(&raw) {
+        return Err(SlugError::Reserved);
+    }
+
+    Ok(())
 }
 
 impl fmt::Display for Slug {
@@ -158,6 +186,140 @@ impl<'de> Deserialize<'de> for Slug {
     }
 }
 
+/// Validated package identifier within a project. Cheap to clone.
+///
+/// A `PackageSlug` is the name of a single folder under
+/// `projects/<project-slug>/packages/<package-slug>/`. The same FS-safety
+/// rules apply as for project [`Slug`]s — `PackageSlug` exists as a
+/// separate type purely to prevent compile-time confusion: a function
+/// expecting a `PackageSlug` cannot accidentally receive a `Slug` (which
+/// names the *enclosing* project) and vice versa.
+///
+/// Construct via [`PackageSlug::new`] or `parse()`/`FromStr` / `TryFrom`.
+/// `Deserialize` routes through the validator.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct PackageSlug(String);
+
+impl PackageSlug {
+    /// Validate `raw` against the package-slug ruleset and return an owned
+    /// `PackageSlug`. Length bounds are
+    /// `[PACKAGE_SLUG_MIN_LEN, PACKAGE_SLUG_MAX_LEN]`; all other rules are
+    /// shared with [`Slug`] via [`validate_slug_chars`].
+    pub fn new(raw: &str) -> Result<Self, SlugError> {
+        validate_slug_chars(raw, PACKAGE_SLUG_MIN_LEN, PACKAGE_SLUG_MAX_LEN)?;
+        Ok(PackageSlug(raw.to_owned()))
+    }
+
+    /// Borrow the underlying string. Safe to use as a filesystem path
+    /// component — every byte has been validated.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The canonical root package slug (`"main"`). Used by the legacy-shape
+    /// project migration to synthesise a one-package tree from a
+    /// single-graph `project.json`.
+    pub fn root() -> Self {
+        // Safe: `"main"` is a 4-char ASCII lowercase string that passes
+        // every rule. Constructed here rather than via `new` so the hot
+        // legacy-migration path never reaches the validator.
+        PackageSlug(ROOT_PACKAGE_SLUG.to_string())
+    }
+}
+
+impl fmt::Display for PackageSlug {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for PackageSlug {
+    type Err = SlugError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        PackageSlug::new(s)
+    }
+}
+
+impl TryFrom<&str> for PackageSlug {
+    type Error = SlugError;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        PackageSlug::new(value)
+    }
+}
+
+impl TryFrom<String> for PackageSlug {
+    type Error = SlugError;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        PackageSlug::new(&value)
+    }
+}
+
+// Same closed-deser pattern as `Slug` — malformed package slugs fail at
+// JSON deserialise time so handler code never sees an invalid value.
+impl<'de> Deserialize<'de> for PackageSlug {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        PackageSlug::new(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Stable opaque identifier for a [`Package`]. The studio assigns UUIDs at
+/// create time; this type carries no validator because the id never
+/// reaches the filesystem (only the slug does).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PackageId(pub String);
+
+/// One node in a project's package tree.
+///
+/// A package corresponds 1:1 with a Rust module under `src/<path>/mod.rs`.
+/// The tree shape is fully user-controlled — the studio neither
+/// prescribes nor presupposes any layout (DDD, hexagonal, flat, library,
+/// workspace, etc. are all valid).
+///
+/// Invariants enforced by [`Project::validate_package_tree`]:
+/// 1. Exactly one root (`parent_id == None`).
+/// 2. No duplicate package ids.
+/// 3. Sibling slugs are unique (so the `src/<path>/` segment is
+///    unambiguous).
+/// 4. Every `parent_id` resolves to an existing package id.
+/// 5. The parent chain is acyclic (a DFS from the root reaches every
+///    package).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Package {
+    pub id: PackageId,
+    pub slug: PackageSlug,
+    /// `None` for the root package; otherwise points to the parent
+    /// package's [`PackageId`].
+    pub parent_id: Option<PackageId>,
+    /// Optional user-facing label shown in the package-tree sidebar. The
+    /// UI falls back to `slug` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// Reasons a package tree failed structural validation. Surfaced server-side
+/// via logs; the client gets a sanitised summary through `ApiError`.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum PackageTreeError {
+    #[error("package tree must contain at least one package")]
+    Empty,
+    #[error("package tree must have exactly one root (parent_id == None); found {0}")]
+    RootCount(usize),
+    #[error("duplicate package id: {0}")]
+    DuplicateId(String),
+    #[error("duplicate slug {slug} under parent {parent:?}")]
+    DuplicateSiblingSlug { slug: String, parent: Option<String> },
+    #[error("package {child} references non-existent parent id {parent}")]
+    DanglingParent { child: String, parent: String },
+    #[error("cycle detected in package tree involving id {0}")]
+    Cycle(String),
+}
+
 /// Lightweight metadata header returned by `GET /api/projects`. The full
 /// `Project` document also includes this struct as `meta`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,15 +335,154 @@ pub struct ProjectMeta {
     pub schema_version: u32,
 }
 
+/// Stable, recognisable [`PackageId`] for the root package synthesised when
+/// a legacy single-graph `project.json` is migrated to the multi-package
+/// shape. New roots created by users get fresh UUIDs; this literal is
+/// reserved for the migration path so support staff can identify
+/// pre-Section-1 projects at a glance.
+pub const LEGACY_ROOT_PACKAGE_ID: &str = "pkg-root";
+
+/// Default value for [`Project::packages`] when the field is absent on
+/// disk (pre-Section-1 single-graph projects). Synthesises a one-package
+/// tree with a root named `"main"` so existing `graph.json` data can be
+/// hoisted into `packages/main/graph.json` on the first save (the disk
+/// migration runs at the store layer in T2).
+fn default_root_packages() -> Vec<Package> {
+    vec![Package {
+        id: PackageId(LEGACY_ROOT_PACKAGE_ID.to_string()),
+        slug: PackageSlug::root(),
+        parent_id: None,
+        label: None,
+    }]
+}
+
 /// Full project document persisted at `projects/<slug>/project.json`.
 ///
-/// The graph is intentionally NOT inlined here — it has its own file
-/// (`graph.json`) so the studio can edit the metadata and the graph
-/// independently and so a large graph doesn't bloat list responses.
+/// Graph data is NOT inlined here — each package has its own
+/// `packages/<pkg-slug>/graph.json` file so list endpoints and metadata
+/// edits never read large graph blobs.
+///
+/// ## On-disk shape (current)
+///
+/// ```json
+/// {
+///   "slug": "...", "name": "...", "created_at": "...",
+///   "updated_at": "...", "schema_version": 1,
+///   "packages": [
+///     { "id": "...", "slug": "main", "parent_id": null }
+///   ]
+/// }
+/// ```
+///
+/// ## Legacy shape (pre-Section-1 single-graph projects)
+///
+/// `packages` field absent. The custom `default` synthesises a one-root
+/// tree (`slug = "main"`, `id = "pkg-root"`) so legacy files round-trip
+/// without loss. The next save by the store layer writes the canonical
+/// shape; the disk-side `graph.json` → `packages/main/graph.json` hoist
+/// runs in T2.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     #[serde(flatten)]
     pub meta: ProjectMeta,
+    /// User-defined package tree. Never empty in valid documents; on
+    /// legacy load, [`default_root_packages`] supplies a single root.
+    /// Structural validity is verified by
+    /// [`Project::validate_package_tree`] before the project is handed to
+    /// any caller; the field is left `pub` for ergonomic construction
+    /// in tests and migrations only.
+    #[serde(default = "default_root_packages")]
+    pub packages: Vec<Package>,
+}
+
+impl Project {
+    /// Verify the package tree satisfies all five structural invariants
+    /// documented on [`Package`]. Pure function over `self.packages`.
+    ///
+    /// Complexity: O(n) for the id-uniqueness, root-count, dangling-
+    /// parent, and sibling-slug checks; O(n × depth) for the cycle walk
+    /// (each node walks up to its root). Worst case for a degenerate
+    /// linear chain of N packages is O(n²); typical projects carry
+    /// dozens of packages, so the quadratic term is dominated by
+    /// constants in practice.
+    ///
+    /// Call this:
+    /// - After loading a `project.json` from disk, before exposing the
+    ///   project to handler code.
+    /// - Before writing any user-driven mutation (create / rename /
+    ///   delete package) so a malformed tree never reaches disk.
+    pub fn validate_package_tree(&self) -> Result<(), PackageTreeError> {
+        use std::collections::{HashMap, HashSet};
+
+        if self.packages.is_empty() {
+            return Err(PackageTreeError::Empty);
+        }
+
+        // Invariant 2: unique ids. Build the id→parent map alongside so
+        // we don't pay a second pass.
+        let mut id_to_parent: HashMap<&PackageId, &Option<PackageId>> =
+            HashMap::with_capacity(self.packages.len());
+        for p in &self.packages {
+            if id_to_parent.insert(&p.id, &p.parent_id).is_some() {
+                return Err(PackageTreeError::DuplicateId(p.id.0.clone()));
+            }
+        }
+
+        // Invariant 1: exactly one root.
+        let root_count = self.packages.iter().filter(|p| p.parent_id.is_none()).count();
+        if root_count != 1 {
+            return Err(PackageTreeError::RootCount(root_count));
+        }
+
+        // Invariant 4: every parent_id resolves.
+        for p in &self.packages {
+            if let Some(parent) = &p.parent_id {
+                if !id_to_parent.contains_key(parent) {
+                    return Err(PackageTreeError::DanglingParent {
+                        child: p.id.0.clone(),
+                        parent: parent.0.clone(),
+                    });
+                }
+            }
+        }
+
+        // Invariant 3: sibling slug uniqueness. Key is (parent_id_str,
+        // slug_str) — siblings share a parent and must not collide.
+        let mut sibling_keys: HashSet<(Option<&str>, &str)> =
+            HashSet::with_capacity(self.packages.len());
+        for p in &self.packages {
+            let key = (
+                p.parent_id.as_ref().map(|pid| pid.0.as_str()),
+                p.slug.as_str(),
+            );
+            if !sibling_keys.insert(key) {
+                return Err(PackageTreeError::DuplicateSiblingSlug {
+                    slug: p.slug.0.clone(),
+                    parent: p.parent_id.as_ref().map(|pid| pid.0.clone()),
+                });
+            }
+        }
+
+        // Invariant 5: acyclic. Walk each node up to the root; if we revisit
+        // any id in a single walk, there's a cycle. Bound the walk by the
+        // total node count so a malicious tree can't loop forever.
+        for p in &self.packages {
+            let mut seen: HashSet<&PackageId> = HashSet::new();
+            let mut cursor: Option<&PackageId> = p.parent_id.as_ref();
+            let mut steps = 0usize;
+            while let Some(pid) = cursor {
+                if !seen.insert(pid) || steps > self.packages.len() {
+                    return Err(PackageTreeError::Cycle(p.id.0.clone()));
+                }
+                cursor = id_to_parent
+                    .get(pid)
+                    .and_then(|parent_opt| parent_opt.as_ref());
+                steps += 1;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Stable identifier for a graph node. The studio assigns UUIDs at create
@@ -594,5 +895,238 @@ mod tests {
             "position": {"x": 0.0, "y": 0.0},
         }));
         assert!(r.is_err(), "unknown legacy kind should still be rejected");
+    }
+
+    // ----- PackageSlug -----
+
+    #[test]
+    fn test_package_slug_shares_rules_with_slug() {
+        // Same validator means the same accepted forms.
+        assert!(PackageSlug::new("main").is_ok());
+        assert!(PackageSlug::new("auth-store").is_ok());
+        assert!(PackageSlug::new("a1").is_ok());
+
+        // Same rejections.
+        assert!(matches!(PackageSlug::new(""), Err(SlugError::Length(0))));
+        assert!(matches!(PackageSlug::new("A"), Err(SlugError::Length(1))));
+        assert!(matches!(PackageSlug::new("Main"), Err(SlugError::BadStart)));
+        assert!(matches!(PackageSlug::new("main-"), Err(SlugError::BadEnd)));
+        assert!(matches!(PackageSlug::new("a/b"), Err(SlugError::BadChar(_))));
+        assert!(matches!(PackageSlug::new(".."), Err(SlugError::BadStart)));
+        assert!(matches!(PackageSlug::new("con"), Err(SlugError::Reserved)));
+    }
+
+    #[test]
+    fn test_package_slug_root_is_main() {
+        // `root()` must produce the exact byte sequence that the legacy
+        // disk-migration path uses. Renaming this would orphan every
+        // pre-Section-1 project.
+        assert_eq!(PackageSlug::root().as_str(), "main");
+        assert_eq!(PackageSlug::root().as_str(), ROOT_PACKAGE_SLUG);
+    }
+
+    #[test]
+    fn test_package_slug_round_trips_through_json() {
+        let s = PackageSlug::new("user-service").unwrap();
+        let json = serde_json::to_string(&s).unwrap();
+        assert_eq!(json, "\"user-service\"");
+        let back: PackageSlug = serde_json::from_str(&json).unwrap();
+        assert_eq!(s, back);
+    }
+
+    #[test]
+    fn test_package_slug_deserialize_rejects_invalid_payloads() {
+        // Closed-deser: a malformed slug arriving in a JSON request body
+        // must fail at deserialise time, not later.
+        let r: Result<PackageSlug, _> = serde_json::from_str("\"BadCase\"");
+        assert!(r.is_err());
+        let r: Result<PackageSlug, _> = serde_json::from_str("\"con\"");
+        assert!(r.is_err());
+    }
+
+    // ----- Project package tree -----
+
+    fn pkg(id: &str, slug: &str, parent: Option<&str>) -> Package {
+        Package {
+            id: PackageId(id.to_string()),
+            slug: PackageSlug::new(slug).unwrap(),
+            parent_id: parent.map(|s| PackageId(s.to_string())),
+            label: None,
+        }
+    }
+
+    fn project_with_packages(packages: Vec<Package>) -> Project {
+        Project {
+            meta: ProjectMeta {
+                slug: Slug::new("demo").unwrap(),
+                name: "Demo".into(),
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                updated_at: OffsetDateTime::UNIX_EPOCH,
+                schema_version: PROJECT_SCHEMA_VERSION,
+            },
+            packages,
+        }
+    }
+
+    #[test]
+    fn test_project_legacy_json_synthesises_root_package() {
+        // Pre-Section-1 project.json has no `packages` field. The default
+        // must lift it into a one-root tree so the next save can write
+        // the canonical shape (and T2's disk migration can hoist
+        // graph.json into packages/main/).
+        let legacy = serde_json::json!({
+            "slug": "demo",
+            "name": "Demo",
+            "created_at": "1970-01-01T00:00:00Z",
+            "updated_at": "1970-01-01T00:00:00Z",
+            "schema_version": 1
+        });
+        let p: Project = serde_json::from_value(legacy).unwrap();
+        assert_eq!(p.packages.len(), 1);
+        assert!(p.packages[0].parent_id.is_none());
+        assert_eq!(p.packages[0].slug.as_str(), "main");
+        assert_eq!(p.packages[0].id.0, LEGACY_ROOT_PACKAGE_ID);
+        p.validate_package_tree()
+            .expect("synthesised root must be a valid tree");
+    }
+
+    #[test]
+    fn test_project_canonical_json_preserves_packages() {
+        let canonical = serde_json::json!({
+            "slug": "demo",
+            "name": "Demo",
+            "created_at": "1970-01-01T00:00:00Z",
+            "updated_at": "1970-01-01T00:00:00Z",
+            "schema_version": 1,
+            "packages": [
+                { "id": "r", "slug": "core", "parent_id": null },
+                { "id": "c", "slug": "auth", "parent_id": "r" }
+            ]
+        });
+        let p: Project = serde_json::from_value(canonical).unwrap();
+        assert_eq!(p.packages.len(), 2);
+        assert_eq!(p.packages[0].id.0, "r");
+        assert_eq!(p.packages[1].parent_id.as_ref().unwrap().0, "r");
+        p.validate_package_tree().unwrap();
+    }
+
+    #[test]
+    fn test_validate_package_tree_rejects_empty() {
+        let p = project_with_packages(vec![]);
+        assert_eq!(p.validate_package_tree(), Err(PackageTreeError::Empty));
+    }
+
+    #[test]
+    fn test_validate_package_tree_rejects_zero_or_multiple_roots() {
+        // Zero roots: every node has a parent so the tree has no entry
+        // point. The validator's root-count check fires regardless of
+        // whether the chain is also cyclic.
+        let no_root = project_with_packages(vec![
+            pkg("a", "alpha", Some("b")),
+            pkg("b", "beta", Some("a")),
+        ]);
+        assert_eq!(
+            no_root.validate_package_tree(),
+            Err(PackageTreeError::RootCount(0))
+        );
+
+        // Two roots: ambiguous which is the project entry point.
+        let two_roots = project_with_packages(vec![
+            pkg("a", "alpha", None),
+            pkg("b", "beta", None),
+        ]);
+        assert_eq!(
+            two_roots.validate_package_tree(),
+            Err(PackageTreeError::RootCount(2))
+        );
+    }
+
+    #[test]
+    fn test_validate_package_tree_rejects_duplicate_ids() {
+        let p = project_with_packages(vec![
+            pkg("a", "alpha", None),
+            pkg("a", "beta", Some("a")),
+        ]);
+        assert_eq!(
+            p.validate_package_tree(),
+            Err(PackageTreeError::DuplicateId("a".into()))
+        );
+    }
+
+    #[test]
+    fn test_validate_package_tree_rejects_sibling_slug_collision() {
+        // Two children of the same parent can't share a slug — they would
+        // claim the same `src/<parent>/<slug>/` folder.
+        let p = project_with_packages(vec![
+            pkg("r", "root", None),
+            pkg("c1", "child", Some("r")),
+            pkg("c2", "child", Some("r")),
+        ]);
+        match p.validate_package_tree() {
+            Err(PackageTreeError::DuplicateSiblingSlug { slug, parent }) => {
+                assert_eq!(slug, "child");
+                assert_eq!(parent.as_deref(), Some("r"));
+            }
+            other => panic!("expected DuplicateSiblingSlug, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_validate_package_tree_allows_same_slug_under_different_parents() {
+        // Two cousins both named `util` is fine — they map to different
+        // module paths (`a::util` and `b::util`).
+        let p = project_with_packages(vec![
+            pkg("r", "root", None),
+            pkg("a", "alpha", Some("r")),
+            pkg("b", "beta", Some("r")),
+            pkg("au", "util", Some("a")),
+            pkg("bu", "util", Some("b")),
+        ]);
+        p.validate_package_tree().unwrap();
+    }
+
+    #[test]
+    fn test_validate_package_tree_rejects_dangling_parent() {
+        let p = project_with_packages(vec![
+            pkg("r", "root", None),
+            pkg("c", "child", Some("ghost")),
+        ]);
+        match p.validate_package_tree() {
+            Err(PackageTreeError::DanglingParent { child, parent }) => {
+                assert_eq!(child, "c");
+                assert_eq!(parent, "ghost");
+            }
+            other => panic!("expected DanglingParent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_validate_package_tree_rejects_cycle() {
+        // A valid root plus a two-node cycle alongside it. Root-count is
+        // satisfied (exactly one None parent), ids are unique, every
+        // parent resolves — so the only remaining defence is the cycle
+        // walk, which must catch the a→b→a loop.
+        let p = project_with_packages(vec![
+            pkg("r", "root", None),
+            pkg("a", "alpha", Some("b")),
+            pkg("b", "beta", Some("a")),
+        ]);
+        match p.validate_package_tree() {
+            Err(PackageTreeError::Cycle(_)) => {}
+            other => panic!("expected Cycle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_project_round_trip_preserves_package_tree() {
+        let original = project_with_packages(vec![
+            pkg("r", "root", None),
+            pkg("a", "auth", Some("r")),
+            pkg("s", "store", Some("r")),
+        ]);
+        let json = serde_json::to_string(&original).unwrap();
+        let back: Project = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.packages, original.packages);
+        back.validate_package_tree().unwrap();
     }
 }

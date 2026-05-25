@@ -18,7 +18,7 @@ interface FilterCriteria {
 export default function SqlBuilder({
   slug,
   connectionString,
-  initialQuery,
+  initialQuery: _initialQuery,
   onSave,
   onClose,
 }: SqlBuilderProps): JSX.Element {

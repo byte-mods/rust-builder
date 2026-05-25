@@ -4,12 +4,32 @@ _Single source of truth for in-flight work. Updated by the agent before starting
 
 ## In progress
 
-- [Section 1 — Type inference across edges] — started 2026-05-24T00:50:00+05:30
-  - [T1] codegen::types module + TypeResolver + ResolvedType + PortSide — completed 2026-05-24T01:05:00+05:30 — super-qa PASS, 7 new tests, full lib suite green (255 passed), 2 non-blocking MINORs noted.
+- [Section 1 — Multi-package project model (Visual Backend Engineering roadmap, S1 of 10)] — started 2026-05-25T00:35:00+05:30
+  - [T1] Backend data model: Package + Project.packages — completed 2026-05-25T01:35:00+05:30 — super-qa PASS round 1 (5 MINORs, 2 fixed inline). Added PackageSlug, PackageId, Package, PackageTreeError, Project::validate_package_tree, default_root_packages, LEGACY_ROOT_PACKAGE_ID, ROOT_PACKAGE_SLUG. Refactored Slug::new to share validate_slug_chars helper with PackageSlug. Legacy project.json (no `packages` field) deserialises into a one-root tree with slug="main"/id="pkg-root". Full suite green: 271 lib + 28 projects + 8 templates = 307 tests pass.
+  - [T2] Storage layout migration: per-package graph.json — completed 2026-05-25T02:10:00+05:30 — super-qa PASS round 1 (2 MINORs; concurrent-rename race fix landed inline with regression test, multi-package export/import deferred to T3). Added PACKAGES_DIR const + 5 helpers (packages_dir, package_dir, package_graph_path, migrate_legacy_graph_if_needed, load_graph_for_package). Routed create/load/load_graph/save_graph/export_archive/import_archive through new layout. load now calls Project::validate_package_tree and surfaces failures as InvalidBody. Migration is idempotent and concurrent-safe (NotFound on rename treated as already-done). 6 new store tests + 2 integration test path fixes. Full suite green: 320+ tests pass.
+  - [T3] CRUD HTTP endpoints for packages — completed 2026-05-25T02:45:00+05:30 — super-qa PASS round 1 (3 MINORs, all fixed inline). Six endpoints: GET/POST /packages, PATCH/DELETE /packages/:pkg, GET/PUT /packages/:pkg/graph. New ApiError::Conflict(String) for 409 (delete-root, sibling-slug collision). Store-layer additions: mutate_project (closure-based atomic mutator with per-slug lock + post-mutation validate_package_tree), save_graph_for_package, delete_package_dir, rename_package_dir. Server-side UUID minting for PackageId (addresses T1 follow-up MINOR — no client-controlled empty/duplicate ids). PATCH rename does atomic disk folder move with best-effort tree rollback on disk failure. DELETE non-leaf does BFS descendant cascade. 11 new integration tests + full suite green: 333+ tests pass.
+  - [T4] Codegen emits nested Rust modules per package — completed 2026-05-25T03:25:00+05:30 — super-qa round 1 FAIL → round 2 PASS after BLOCKER fix. Round 1 caught a destructive overwrite when a child package slug collided with a per-node emission dir (e.g. child named `handlers` overwriting `src/handlers/mod.rs`). Fix: T4 child-mod-writer now reads existing files first; if a module_decls region is present, it splices new grandchild decls into the existing body via regions::merge instead of overwriting. Added regression test test_generate_project_tree_preserves_existing_mod_rs_on_slug_collision. New API: Generator::generate_project_tree (walks package tree, writes nested src/<path>/mod.rs files, splices `pub mod <child>;` into parent's module_decls region) + helper package_relative_path. generate_project keeps working as a shim. regen_project handler loads every package's graph and dispatches to the tree walker. 4 new unit tests + 1 new integration test. Full suite green: 281 lib + 40 projects + 8 templates = 338 tests pass.
+  - [T5] Frontend package-tree sidebar — pending. Open T4 follow-up MINORs: (a) no test asserts byte-identical output of single-package legacy vs new tree walker (Req 5 structurally argued, not verified); (b) E2E regen test does not run `cargo check` on the output so future BLOCKERs of similar shape could escape. Carried follow-up from T2: extend export/import to walk all packages.
+  - [T5] Frontend package-tree sidebar — pending
+  - [T6] Integration tests: legacy migration + multi-package regen — pending
 
 ## Queued
 
-- [Section 2 — S19 Visual Test Runner]
+- [Visual Backend Engineering — Section 2: Cross-package symbol import]
+- [Visual Backend Engineering — Section 3: Static constants + module items (const/static/use/type_alias)]
+- [Visual Backend Engineering — Section 4: Object parsing + validation primitives (serde + validate.*)]
+- [Visual Backend Engineering — Section 5: DI container + connection-injection nodes]
+- [Visual Backend Engineering — Section 6: Trait + Query nodes (DDD layer)]
+- [Visual Backend Engineering — Section 7: Route + Service nodes (actix/axum)]
+- [Visual Backend Engineering — Section 8: Both-framework support (actix or axum from same graph)]
+- [Visual Backend Engineering — Section 9: Consumer/Scheduler nodes]
+- [Visual Backend Engineering — Section 10: End-to-end demo (2-3 actix-MongoDB routes, zero raw Rust)]
+- [Deferred — previously-queued: Type inference across edges (was Section 1 of prior plan; T1 already done — fold its T2+ into Section 2 of new plan via cross-package symbol resolution)]
+- [Deferred — previously-queued: S19 Visual Test Runner]
+- [Deferred — previously-queued: S17 Framework Deep Customization drawer (middleware, CORS, rate-limit, hooks)]
+- [Deferred — previously-queued: S20 Auto-fix suggestions]
+- [Deferred — previously-queued: Connector packs: messaging / databases / search & storage]
+- [Deferred — previously-queued: Streaming gaps, Observability, Deployment, Type-system extras, Claude CLI per-project chat, S14 Final polish]
 - [Section 3 — S17 Framework Deep Customization drawer (middleware, CORS, rate-limit, hooks)]
 - [Section 4 — S20 Auto-fix suggestions]
 - [Section 5 — Connector pack: messaging family (Redis Pub/Sub, NATS, RabbitMQ, Pulsar)]

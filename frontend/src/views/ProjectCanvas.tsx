@@ -20,6 +20,7 @@ import {
   loadGraph,
   saveGraph,
   buildWebSocketUrl,
+  collabWebSocketUrl,
   triggerBuild,
   type BuildEvent,
   type Graph,
@@ -33,6 +34,7 @@ import {
   triggerDebug,
   fetchRunStatus,
   type RunEvent,
+  type PerformanceStats,
   generateFlow,
   refineFlow,
   type ChatMessage,
@@ -46,6 +48,17 @@ import EntryPointNode from "./EntryPointNode";
 import StudioNode from "./StudioNode";
 import { SecurityDrawer } from "./SecurityDrawer";
 
+
+const MARKETPLACE_CATALOG = [
+  { id: "scylla", name: "ScyllaDB NoSQL", icon: "⚡", crate: "scylla @ 0.10.0", desc: "High-performance, low-latency C++ Cassandra-compatible NoSQL database.", category: "Database" },
+  { id: "mongodb", name: "MongoDB Client", icon: "🍃", crate: "mongodb @ 2.8.0", desc: "Enterprise document-store NoSQL database utilizing BSON document filtering.", category: "Database" },
+  { id: "nats", name: "NATS PubSub", icon: "🌐", crate: "async-nats @ 0.33.0", desc: "Cloud-native, ultra-high performance lightweight subscription & messaging queue.", category: "PubSub" },
+  { id: "surrealdb", name: "SurrealDB Multi-Model", icon: "🔮", crate: "surrealdb @ 1.0.0", desc: "Scalable developer-friendly multi-model relational graph database.", category: "Database" },
+  { id: "clickhouse", name: "ClickHouse Analytics", icon: "📊", crate: "clickhouse @ 0.11.0", desc: "Column-oriented analytical DBMS enabling real-time big-data aggregates.", category: "Analytics" },
+  { id: "s3", name: "AWS S3 Storage", icon: "📦", crate: "aws-sdk-s3 @ 1.0.0", desc: "Scalable cloud-based object storage for file streams and metadata blobs.", category: "Cloud" },
+  { id: "webrtc", name: "WebRTC Channels", icon: "📞", crate: "webrtc @ 0.10.0", desc: "Real-time communication, audio, video and binary peer transports.", category: "Network" },
+  { id: "rabbitmq", name: "RabbitMQ (AMQP)", icon: "🐇", crate: "lapin @ 0.15.0", desc: "Robust and reliable AMQP-protocol message queue broker client.", category: "PubSub" },
+];
 
 interface ProjectCanvasProps {
   slug: string;
@@ -67,6 +80,8 @@ interface NodeData extends Record<string, unknown> {
   label: string;
   templateId: string;
   config: unknown;
+  comment?: string;
+  diagnostics?: any[];
 }
 
 let idCounter = 0;
@@ -95,7 +110,7 @@ function toRfNode(
       templateId,
       config: gn.config ?? {},
       inputs: (templateId === "custom.block" || templateId === "grpc.server")
-        ? (gn.config?.inputs || []).map((p: any) => ({
+        ? ((gn.config as any)?.inputs || []).map((p: any) => ({
             name: p.name,
             type_tag: p.ty,
             multiplicity: "single",
@@ -103,7 +118,7 @@ function toRfNode(
           }))
         : template?.input_ports ?? [],
       outputs: (templateId === "custom.block" || templateId === "grpc.server")
-        ? (gn.config?.outputs || []).map((p: any) => ({
+        ? ((gn.config as any)?.outputs || []).map((p: any) => ({
             name: p.name,
             type_tag: p.ty,
             multiplicity: "single",
@@ -235,7 +250,7 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
 
   const [nodes, setNodes, onNodesChange] = useNodesState<Node<NodeData>>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
-  const { screenToFlowPosition, setCenter } = useReactFlow();
+  const { screenToFlowPosition, setCenter, fitView } = useReactFlow();
 
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
 
@@ -247,6 +262,8 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
   const linesEndRef = useRef<HTMLDivElement | null>(null);
 
   const saveTimerRef = useRef<number | null>(null);
+  const [saveStatus, setSaveStatus] = useState<'saved' | 'saving' | 'unsaved' | 'error'>('saved');
+  const [isConsoleCollapsed, setIsConsoleCollapsed] = useState<boolean>(false);
 
   const myCollabUser = useMemo(() => {
     const key = `collab_user_${slug}`;
@@ -301,10 +318,76 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
 
   const chatMessagesEndRef = useRef<HTMLDivElement | null>(null);
 
+  // LLM Selector states (secure, scoped per-provider client API key storage)
+  const [showLlmSettings, setShowLlmSettings] = useState(false);
+  const [llmProvider, setLlmProvider] = useState<string>(() => {
+    return localStorage.getItem("rust_builder_llm_provider") || "claude_cli";
+  });
+  const [llmApiKey, setLlmApiKey] = useState<string>("");
+  const [llmModel, setLlmModel] = useState<string>("");
+
+  const DEFAULT_MODELS: Record<string, string> = {
+    claude_cli: "claude",
+    anthropic: "claude-3-5-sonnet-latest",
+    open_ai: "gpt-4o",
+    deep_seek: "deepseek-chat",
+    kimi: "moonshot-v1-8k",
+    codex: "gpt-4o"
+  };
+
+  useEffect(() => {
+    localStorage.setItem("rust_builder_llm_provider", llmProvider);
+    const storedKey = localStorage.getItem(`rust_builder_llm_api_key_${llmProvider}`) || "";
+    const storedModel = localStorage.getItem(`rust_builder_llm_model_${llmProvider}`) || DEFAULT_MODELS[llmProvider] || "";
+    setLlmApiKey(storedKey);
+    setLlmModel(storedModel);
+  }, [llmProvider]);
+
+  const saveLlmCredentials = (key: string, model: string) => {
+    setLlmApiKey(key);
+    setLlmModel(model);
+    localStorage.setItem(`rust_builder_llm_api_key_${llmProvider}`, key);
+    localStorage.setItem(`rust_builder_llm_model_${llmProvider}`, model);
+  };
+
   // Auto-scroll chat to bottom
   useEffect(() => {
     chatMessagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [activeSession?.messages, aiLoading]);
+
+  // Marketplace S22 state & actions
+  const [installedMarketplace, setInstalledMarketplace] = useState<string[]>([]);
+  const [sidebarTab, setSidebarTab] = useState<"nodes" | "marketplace">("nodes");
+
+  useEffect(() => {
+    let active = true;
+    import("../api").then(({ fetchMarketplace }) => {
+      fetchMarketplace(slug)
+        .then((pkgs) => {
+          if (active) setInstalledMarketplace(pkgs);
+        })
+        .catch((err) => console.error("Failed to load marketplace installed packages", err));
+    });
+    return () => { active = false; };
+  }, [slug]);
+
+  async function handleToggleInstall(packageId: string, isInstalled: boolean) {
+    const api = await import("../api");
+    try {
+      let pkgs: string[];
+      if (isInstalled) {
+        pkgs = await api.uninstallMarketplacePackage(slug, packageId);
+        setBuildLines((prev) => [...prev, `[system] Uninstalled marketplace package: ${packageId}`]);
+      } else {
+        pkgs = await api.installMarketplacePackage(slug, packageId);
+        setBuildLines((prev) => [...prev, `[system] Installed marketplace package: ${packageId}`]);
+      }
+      setInstalledMarketplace(pkgs);
+    } catch (err: unknown) {
+      const msg = err instanceof api.ApiError ? err.message : String(err);
+      setBuildLines((prev) => [...prev, `[error] Marketplace action failed: ${msg}`]);
+    }
+  }
 
   // Load chat sessions from localStorage
   useEffect(() => {
@@ -603,7 +686,7 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
     try {
       await saveGraph(slug, proposedGraph);
       setState({ kind: "ready", graph: proposedGraph });
-      setNodes(proposedGraph.nodes.map(toRfNode));
+      setNodes(proposedGraph.nodes.map((node) => toRfNode(node, templates, diagnostics)));
       setEdges(proposedGraph.edges.map(toRfEdge));
       setProposedGraph(null);
       handleBuild(false);
@@ -647,7 +730,14 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
       : [];
 
     try {
-      const result = await generateFlow(slug, promptText, historyPayload);
+      const result = await generateFlow(
+        slug,
+        promptText,
+        historyPayload,
+        llmProvider,
+        llmApiKey || undefined,
+        llmModel || undefined
+      );
       setProposedGraph(result);
 
       // Add success response from assistant
@@ -721,7 +811,14 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
       : [];
 
     try {
-      const result = await refineFlow(slug, promptText, historyPayload);
+      const result = await refineFlow(
+        slug,
+        promptText,
+        historyPayload,
+        llmProvider,
+        llmApiKey || undefined,
+        llmModel || undefined
+      );
       setProposedGraph(result);
 
       // Add success response from assistant
@@ -767,7 +864,7 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
     loadGraph(slug, controller.signal)
       .then((graph) => {
         setState({ kind: "ready", graph });
-        setNodes(graph.nodes.map(toRfNode));
+        setNodes(graph.nodes.map((node) => toRfNode(node, templates, diagnostics)));
         setEdges(graph.edges.map(toRfEdge));
       })
       .catch((err: unknown) => {
@@ -985,20 +1082,23 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [debugModeActive, debugPausedNodeId, slug]);
 
-  // Debounced save
+  // Debounced save (5 seconds delay)
   const scheduleSave = useCallback(
     (nextNodes: Node<NodeData>[], nextEdges: Edge[]) => {
       if (isRemoteUpdateRef.current) return;
+      setSaveStatus("unsaved");
       if (saveTimerRef.current) {
         window.clearTimeout(saveTimerRef.current);
       }
       saveTimerRef.current = window.setTimeout(() => {
+        setSaveStatus("saving");
         const graph: Graph = {
           schema_version: 1,
           nodes: nextNodes.map(fromRfNode),
           edges: nextEdges.map(fromRfEdge),
         };
         saveGraph(slug, graph).then(() => {
+          setSaveStatus("saved");
           if (collabWsRef.current && collabWsRef.current.readyState === WebSocket.OPEN) {
             collabWsRef.current.send(JSON.stringify({
               type: "graph_edit",
@@ -1007,19 +1107,48 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
             }));
           }
         }).catch((err: unknown) => {
+          setSaveStatus("error");
           if (err instanceof ApiError) {
             console.error("save failed:", err.message);
           }
         });
-      }, 800);
+      }, 5000); // Auto-save after exactly 5 seconds of inactivity
     },
     [slug, myCollabUser]
   );
 
+  // Manual save trigger (immediate)
+  const handleSave = useCallback(async () => {
+    if (isRemoteUpdateRef.current) return;
+    if (saveTimerRef.current) {
+      window.clearTimeout(saveTimerRef.current);
+    }
+    setSaveStatus("saving");
+    try {
+      const graph: Graph = {
+        schema_version: 1,
+        nodes: nodes.map(fromRfNode),
+        edges: edges.map(fromRfEdge),
+      };
+      await saveGraph(slug, graph);
+      setSaveStatus("saved");
+      if (collabWsRef.current && collabWsRef.current.readyState === WebSocket.OPEN) {
+        collabWsRef.current.send(JSON.stringify({
+          type: "graph_edit",
+          user_id: myCollabUser.id,
+          graph: graph,
+        }));
+      }
+    } catch (err: unknown) {
+      setSaveStatus("error");
+      if (err instanceof ApiError) {
+        console.error("save failed:", err.message);
+      }
+    }
+  }, [slug, nodes, edges, myCollabUser]);
+
   useEffect(() => {
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const host = window.location.host;
-    const wsUrl = `${protocol}//${host}/ws/collab/${slug}`;
+    const wsUrl = collabWebSocketUrl(slug);
     
     const ws = new WebSocket(wsUrl);
     collabWsRef.current = ws;
@@ -1071,8 +1200,8 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
           case "graph_edit": {
             const remoteGraph = data.graph;
             isRemoteUpdateRef.current = true;
-            setNodes(remoteGraph.nodes.map(toRfNode));
-            setEdges(remoteGraph.edges.map(toRfEdge));
+             setNodes(remoteGraph.nodes.map((node: GraphNode) => toRfNode(node, templates, diagnostics)));
+             setEdges(remoteGraph.edges.map(toRfEdge));
             setTimeout(() => {
               isRemoteUpdateRef.current = false;
             }, 50);
@@ -1166,14 +1295,19 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
         y: event.clientY,
       });
 
+      const template = templates.find((t) => t.id === data.templateId);
       const newNode: Node<NodeData> = {
         id: makeNodeId(),
-        type: "default",
+        type: data.templateId === "core.entry_point" ? "entryPoint" : "studio",
         position,
         data: {
-          label: data.templateId,
+          label: template?.display.name ?? data.templateId,
           templateId: data.templateId,
-          config: data.defaultConfig,
+          config: data.defaultConfig ?? {},
+          inputs: template?.input_ports ?? [],
+          outputs: template?.output_ports ?? [],
+          diagnostics: [],
+          comment: "",
         },
       };
 
@@ -1183,17 +1317,22 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
         return next;
       });
     },
-    [screenToFlowPosition, setNodes, edges, scheduleSave, proposedGraph]
+    [screenToFlowPosition, setNodes, edges, scheduleSave, proposedGraph, templates]
   );
 
   const wrappedOnNodesChange = useCallback(
     (changes: Parameters<typeof onNodesChange>[0]) => {
       if (proposedGraph) return;
       onNodesChange(changes);
-      setNodes((current) => {
-        scheduleSave(current, edges);
-        return current;
-      });
+
+      // Only save immediately on structural removals (Backspace/Delete)
+      const hasRemove = changes.some((c) => c.type === "remove");
+      if (hasRemove) {
+        setNodes((current) => {
+          scheduleSave(current, edges);
+          return current;
+        });
+      }
     },
     [onNodesChange, setNodes, edges, scheduleSave, proposedGraph]
   );
@@ -1202,17 +1341,66 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
     (changes: Parameters<typeof onEdgesChange>[0]) => {
       if (proposedGraph) return;
       onEdgesChange(changes);
-      setEdges((current) => {
-        scheduleSave(nodes, current);
-        return current;
-      });
+
+      const hasRemove = changes.some((c) => c.type === "remove");
+      if (hasRemove) {
+        setEdges((current) => {
+          scheduleSave(nodes, current);
+          return current;
+        });
+      }
     },
     [onEdgesChange, setEdges, nodes, scheduleSave, proposedGraph]
+  );
+
+  const onNodeDragStop = useCallback(
+    (_event: React.MouseEvent, _node: Node) => {
+      if (proposedGraph) return;
+      // Dragging has finished: save final coordinates from latest render state
+      scheduleSave(nodes, edges);
+    },
+    [nodes, edges, scheduleSave, proposedGraph]
+  );
+
+  const deleteNode = useCallback(
+    (nodeId: string) => {
+      if (proposedGraph) return;
+      if (!window.confirm("Are you sure you want to delete this node and all its connected edges?")) return;
+
+      setNodes((nds) => {
+        const nextNodes = nds.filter((n) => n.id !== nodeId);
+        setEdges((eds) => {
+          const nextEdges = eds.filter((e) => e.source !== nodeId && e.target !== nodeId);
+          scheduleSave(nextNodes, nextEdges);
+          return nextEdges;
+        });
+        return nextNodes;
+      });
+      setSelectedNodeId(null);
+    },
+    [setNodes, setEdges, scheduleSave, proposedGraph]
+  );
+
+  const deleteEdge = useCallback(
+    (edgeId: string) => {
+      if (proposedGraph) return;
+      setEdges((eds) => {
+        const next = eds.filter((e) => e.id !== edgeId);
+        scheduleSave(nodes, next);
+        return next;
+      });
+    },
+    [nodes, setEdges, scheduleSave, proposedGraph]
   );
 
   const selectedNode = useMemo(
     () => nodes.find((n) => n.id === selectedNodeId) ?? null,
     [nodes, selectedNodeId]
+  );
+
+  const selectedEdge = useMemo(
+    () => edges.find((e) => e.selected) ?? null,
+    [edges]
   );
 
   // Close config drawer if the selected node was deleted.
@@ -1343,6 +1531,7 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
   }, [nodes, edges, proposedGraph, scheduleSave, setNodes, fitView]);
 
   async function handleBuild(release = false) {
+    setIsConsoleCollapsed(false);
     setBuildLines([]);
     setBuildState({ kind: "running" });
     try {
@@ -1355,6 +1544,7 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
   }
 
   async function handleRun() {
+    setIsConsoleCollapsed(false);
     setBuildLines([]);
     setBuildState({ kind: "running" });
     try {
@@ -1376,6 +1566,7 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
   }
 
   async function handleTest() {
+    setIsConsoleCollapsed(false);
     setBuildLines([]);
     setBuildState({ kind: "running" });
     try {
@@ -1388,6 +1579,7 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
   }
 
   async function handleDebug() {
+    setIsConsoleCollapsed(false);
     setBuildLines([]);
     setBuildState({ kind: "running" });
     setInspectedEdgeValues({});
@@ -1460,7 +1652,138 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
             {myCollabUser.username.split("-")[0].substring(0, 2).toUpperCase()}
           </div>
         </div>
-        <button type="button" className="btn-auto-layout" onClick={handleAutoLayout}>
+        {selectedEdge && (
+          <button
+            type="button"
+            className="btn-delete-edge"
+            onClick={() => deleteEdge(selectedEdge.id)}
+            style={{
+              padding: "0.4rem 0.75rem",
+              borderRadius: "6px",
+              border: "1px solid #f43f5e",
+              background: "rgba(244, 63, 94, 0.15)",
+              color: "#fb7185",
+              fontSize: "0.78rem",
+              fontWeight: 600,
+              cursor: "pointer",
+              transition: "all 0.2s",
+              display: "flex",
+              alignItems: "center",
+              gap: "0.35rem",
+              marginLeft: "auto",
+              marginRight: "10px",
+              boxShadow: "0 0 10px rgba(244, 63, 94, 0.2)"
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.background = "#f43f5e";
+              e.currentTarget.style.color = "white";
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.background = "rgba(244, 63, 94, 0.15)";
+              e.currentTarget.style.color = "#fb7185";
+            }}
+          >
+            🗑️ Delete Edge
+          </button>
+        )}
+        {/* S20 IDE Style Run/Debug/Build Controls */}
+        <div className="ide-controls-group" style={{ display: "flex", alignItems: "center", gap: "6px", marginLeft: "12px" }}>
+          <button
+            type="button"
+            className="btn-ide-action btn-check"
+            onClick={() => handleBuild(false)}
+            disabled={buildState.kind === "running" || isRunning}
+            title="Run cargo check to validate visual flow schemas and types"
+          >
+            🔎 Check
+          </button>
+          
+          <button
+            type="button"
+            className="btn-ide-action btn-build-release"
+            onClick={() => handleBuild(true)}
+            disabled={buildState.kind === "running" || isRunning}
+            title="Compile optimized standalone binary for deployment"
+          >
+            📦 Release Build
+          </button>
+
+          <button
+            type="button"
+            className="btn-ide-action btn-test"
+            onClick={handleTest}
+            disabled={buildState.kind === "running" || isRunning}
+            title="Execute cargo test suite to verify handlers and dataflows"
+          >
+            🧪 Test
+          </button>
+
+          <span className="ide-control-divider" style={{ borderLeft: "1px solid rgba(255,255,255,0.15)", height: "16px", margin: "0 4px" }} />
+
+          {isRunning ? (
+            <button
+              type="button"
+              className="btn-ide-action btn-stop danger"
+              onClick={handleStop}
+              title="Stop running service subprocess"
+            >
+              🛑 Stop
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="btn-ide-action btn-run success"
+              onClick={handleRun}
+              disabled={buildState.kind === "running"}
+              title="Boot compile-generation and launch service locally"
+            >
+              ▶️ Run
+            </button>
+          )}
+
+          <button
+            type="button"
+            className="btn-ide-action btn-debug warning"
+            onClick={handleDebug}
+            disabled={buildState.kind === "running" || isRunning}
+            title="Launch dynamic step debugger with active breakpoints"
+          >
+            🪲 Debug
+          </button>
+
+          <span className="ide-control-divider" style={{ borderLeft: "1px solid rgba(255,255,255,0.15)", height: "16px", margin: "0 4px" }} />
+
+          <button
+            type="button"
+            className="btn-ide-action btn-security"
+            onClick={handleSecurityAudit}
+            disabled={securityLoading}
+            title="Execute RUSTSEC audit to scan dependencies and secret leaks"
+          >
+            {securityLoading ? "🛡️ Auditing..." : "🛡️ Security"}
+          </button>
+        </div>
+
+        {/* S20 Premium Save Status & Manual Save Badge */}
+        <div className="save-status-container" style={{ display: "flex", alignItems: "center", gap: "8px", marginLeft: selectedEdge ? "0" : "auto" }}>
+          <span className={`save-status-badge ${saveStatus}`} title="Saves automatically after 5 seconds of inactivity">
+            {saveStatus === "saved" && "🟢 Auto-saved"}
+            {saveStatus === "saving" && "🟡 Saving..."}
+            {saveStatus === "unsaved" && "⏳ Unsaved changes"}
+            {saveStatus === "error" && "🔴 Save failed"}
+          </span>
+          <button
+            type="button"
+            className="btn-manual-save"
+            onClick={handleSave}
+            disabled={saveStatus === "saving"}
+            title="Save changes immediately"
+          >
+            💾 Save
+          </button>
+        </div>
+
+        <button type="button" className="btn-auto-layout" onClick={handleAutoLayout} style={{ marginLeft: "10px" }}>
           🪄 Auto-Layout
         </button>
       </header>
@@ -1483,7 +1806,122 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
       {state.kind === "ready" && (
         <div className="project-canvas-body">
           <aside className="project-sidebar">
-            <NodePalette />
+            <div className="sidebar-tab-header" style={{ display: "flex", borderBottom: "1px solid rgba(255,255,255,0.08)", background: "rgba(0,0,0,0.15)" }}>
+              <button
+                type="button"
+                className={`sidebar-tab-btn ${sidebarTab === "nodes" ? "active" : ""}`}
+                onClick={() => setSidebarTab("nodes")}
+                style={{
+                  flex: 1,
+                  padding: "0.6rem 0.8rem",
+                  background: sidebarTab === "nodes" ? "rgba(99, 102, 241, 0.12)" : "transparent",
+                  color: sidebarTab === "nodes" ? "#818cf8" : "rgba(255,255,255,0.6)",
+                  border: "none",
+                  borderBottom: sidebarTab === "nodes" ? "2px solid #6366f1" : "none",
+                  fontWeight: 600,
+                  fontSize: "0.8rem",
+                  cursor: "pointer",
+                  transition: "all 0.2s"
+                }}
+              >
+                🧩 Nodes
+              </button>
+              <button
+                type="button"
+                className={`sidebar-tab-btn ${sidebarTab === "marketplace" ? "active" : ""}`}
+                onClick={() => setSidebarTab("marketplace")}
+                style={{
+                  flex: 1,
+                  padding: "0.6rem 0.8rem",
+                  background: sidebarTab === "marketplace" ? "rgba(99, 102, 241, 0.12)" : "transparent",
+                  color: sidebarTab === "marketplace" ? "#818cf8" : "rgba(255,255,255,0.6)",
+                  border: "none",
+                  borderBottom: sidebarTab === "marketplace" ? "2px solid #6366f1" : "none",
+                  fontWeight: 600,
+                  fontSize: "0.8rem",
+                  cursor: "pointer",
+                  transition: "all 0.2s"
+                }}
+              >
+                🏪 Marketplace
+              </button>
+            </div>
+
+            {sidebarTab === "nodes" && (
+              <NodePalette installedMarketplace={installedMarketplace} />
+            )}
+
+            {sidebarTab === "marketplace" && (
+              <div className="marketplace-panel" style={{ padding: "0.75rem 0.9rem", display: "flex", flexDirection: "column", gap: "0.5rem" }}>
+                <h2 style={{ fontSize: "0.75rem", textTransform: "uppercase", letterSpacing: "0.06em", margin: "0 0 0.2rem", color: "rgba(255,255,255,0.9)" }}>
+                  Marketplace Catalog
+                </h2>
+                <p className="muted" style={{ fontSize: "0.72rem", margin: 0, lineHeight: 1.3 }}>
+                  Install open-source cloud databases, pubsub streams, and networking solutions used by enterprise companies.
+                </p>
+
+                <div className="marketplace-catalog" style={{ display: "flex", flexDirection: "column", gap: "0.8rem", overflowY: "visible", marginTop: "0.5rem" }}>
+                  {MARKETPLACE_CATALOG.map((item) => {
+                    const isInstalled = installedMarketplace.includes(item.id);
+                    return (
+                      <div
+                        key={item.id}
+                        className="marketplace-card"
+                        style={{
+                          background: "rgba(255, 255, 255, 0.02)",
+                          border: `1px solid ${isInstalled ? "rgba(16, 185, 129, 0.25)" : "rgba(255, 255, 255, 0.06)"}`,
+                          borderRadius: "8px",
+                          padding: "0.75rem",
+                          display: "flex",
+                          flexDirection: "column",
+                          gap: "0.4rem",
+                          transition: "all 0.2s ease"
+                        }}
+                      >
+                        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "6px" }}>
+                          <span style={{ fontSize: "1.1rem" }}>{item.icon}</span>
+                          <span style={{ fontWeight: 600, fontSize: "0.82rem", color: isInstalled ? "#34d399" : "#e2e8f0" }}>{item.name}</span>
+                          <span
+                            className="badge"
+                            style={{
+                              fontSize: "0.62rem",
+                              padding: "1px 5px",
+                              backgroundColor: isInstalled ? "rgba(16, 185, 129, 0.15)" : "rgba(255, 255, 255, 0.08)",
+                              color: isInstalled ? "#34d399" : "rgba(255,255,255,0.5)"
+                            }}
+                          >
+                            {isInstalled ? "Active" : "Crate"}
+                          </span>
+                        </div>
+                        <p style={{ fontSize: "0.72rem", margin: 0, color: "rgba(255, 255, 255, 0.6)", lineHeight: 1.3 }}>
+                          {item.desc}
+                        </p>
+                        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: "0.2rem", fontSize: "0.65rem", color: "rgba(255,255,255,0.4)" }}>
+                          <code>{item.crate}</code>
+                          <button
+                            type="button"
+                            onClick={() => handleToggleInstall(item.id, isInstalled)}
+                            style={{
+                              padding: "0.25rem 0.6rem",
+                              borderRadius: "4px",
+                              border: "none",
+                              fontSize: "0.68rem",
+                              fontWeight: 600,
+                              cursor: "pointer",
+                              background: isInstalled ? "rgba(239, 68, 68, 0.15)" : "linear-gradient(135deg, #6366f1 0%, #4f46e5 100%)",
+                              color: isInstalled ? "#ef4444" : "white",
+                              transition: "all 0.15s"
+                            }}
+                          >
+                            {isInstalled ? "Uninstall" : "Install"}
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
 
             <div className="ai-chat-container">
               <div className="ai-chat-header">
@@ -1491,6 +1929,25 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
                   <h3>AI Chat Assistant</h3>
                 </div>
                 <div className="ai-session-controls">
+                  <button
+                    type="button"
+                    className={`btn-llm-settings ${showLlmSettings ? "active" : ""}`}
+                    onClick={() => setShowLlmSettings(!showLlmSettings)}
+                    title="Configure AI Agent & API Keys"
+                    style={{
+                      background: showLlmSettings ? "rgba(99, 102, 241, 0.25)" : "rgba(127, 127, 127, 0.08)",
+                      color: showLlmSettings ? "white" : "rgba(255, 255, 255, 0.8)",
+                      border: showLlmSettings ? "1px solid rgba(99, 102, 241, 0.5)" : "1px solid rgba(127, 127, 127, 0.2)",
+                      fontSize: "0.7rem",
+                      padding: "0.2rem 0.45rem",
+                      borderRadius: "4px",
+                      cursor: "pointer",
+                      fontWeight: 600,
+                      transition: "all 0.15s ease",
+                    }}
+                  >
+                    ⚙️ Config
+                  </button>
                   <button
                     type="button"
                     className="btn-new-session"
@@ -1511,6 +1968,107 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
                   )}
                 </div>
               </div>
+
+              {showLlmSettings && (
+                <div className="ai-settings-card" style={{
+                  background: "rgba(15, 15, 20, 0.8)",
+                  backdropFilter: "blur(12px)",
+                  border: "1px solid rgba(255, 255, 255, 0.08)",
+                  borderRadius: "8px",
+                  padding: "0.8rem",
+                  margin: "0.4rem 0",
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "0.6rem",
+                  boxShadow: "0 8px 32px rgba(0,0,0,0.5)",
+                }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <h4 style={{ fontSize: "0.75rem", textTransform: "uppercase", letterSpacing: "0.05em", color: "#818cf8", margin: 0 }}>⚙️ AI Agent Setup</h4>
+                    <button
+                      type="button"
+                      onClick={() => setShowLlmSettings(false)}
+                      style={{ background: "none", border: "none", color: "rgba(255,255,255,0.4)", cursor: "pointer", fontSize: "0.75rem" }}
+                    >
+                      ✕
+                    </button>
+                  </div>
+
+                  <div style={{ display: "flex", flexDirection: "column", gap: "0.2rem" }}>
+                    <label style={{ fontSize: "0.65rem", color: "rgba(255,255,255,0.6)", fontWeight: 600 }}>Preferred AI Agent</label>
+                    <select
+                      value={llmProvider}
+                      onChange={(e) => setLlmProvider(e.target.value)}
+                      style={{
+                        background: "#09090b",
+                        border: "1px solid rgba(255,255,255,0.15)",
+                        borderRadius: "4px",
+                        color: "white",
+                        padding: "0.25rem 0.4rem",
+                        fontSize: "0.75rem",
+                      }}
+                    >
+                      <option value="claude_cli">Claude CLI (Local, No Key)</option>
+                      <option value="anthropic">Claude API (Anthropic)</option>
+                      <option value="open_ai">OpenAI (GPT-4o)</option>
+                      <option value="deep_seek">DeepSeek (V3/R1)</option>
+                      <option value="kimi">Kimi (Moonshot)</option>
+                      <option value="codex">Custom OpenAI Codex</option>
+                    </select>
+                  </div>
+
+                  <div style={{ display: "flex", flexDirection: "column", gap: "0.2rem" }}>
+                    <label style={{ fontSize: "0.65rem", color: "rgba(255,255,255,0.6)", fontWeight: 600 }}>Model Name Override</label>
+                    <input
+                      type="text"
+                      placeholder={`Default: ${DEFAULT_MODELS[llmProvider] || ""}`}
+                      value={llmModel}
+                      onChange={(e) => saveLlmCredentials(llmApiKey, e.target.value)}
+                      style={{
+                        background: "#09090b",
+                        border: "1px solid rgba(255,255,255,0.15)",
+                        borderRadius: "4px",
+                        color: "white",
+                        padding: "0.25rem 0.4rem",
+                        fontSize: "0.75rem",
+                      }}
+                    />
+                  </div>
+
+                  {llmProvider !== "claude_cli" && (
+                    <div style={{ display: "flex", flexDirection: "column", gap: "0.2rem" }}>
+                      <label style={{ fontSize: "0.65rem", color: "rgba(255,255,255,0.6)", fontWeight: 600 }}>API Access Token (Client-Stored Only)</label>
+                      <input
+                        type="password"
+                        placeholder="Enter your custom API Key..."
+                        value={llmApiKey}
+                        onChange={(e) => saveLlmCredentials(e.target.value, llmModel)}
+                        style={{
+                          background: "#09090b",
+                          border: "1px solid rgba(255,255,255,0.15)",
+                          borderRadius: "4px",
+                          color: "white",
+                          padding: "0.25rem 0.4rem",
+                          fontSize: "0.75rem",
+                        }}
+                      />
+                    </div>
+                  )}
+
+                  {llmProvider === "claude_cli" && (
+                    <div style={{
+                      fontSize: "0.65rem",
+                      color: "rgba(129, 140, 248, 0.85)",
+                      lineHeight: "1.3",
+                      background: "rgba(99, 102, 241, 0.08)",
+                      border: "1px solid rgba(99, 102, 241, 0.18)",
+                      borderRadius: "4px",
+                      padding: "0.4rem 0.6rem",
+                    }}>
+                      ⚡ <strong>Zero-Key Fallback:</strong> Generates designs locally via the pre-installed <code>claude</code> CLI tool. Make sure <code>claude</code> is configured in your system terminal's PATH.
+                    </div>
+                  )}
+                </div>
+              )}
 
               {sessions.length > 0 && activeSessionId && (
                 <div className="ai-session-bar">
@@ -1632,147 +2190,124 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
               </div>
             </div>
 
-            <div className="build-panel">
-              <h3>Execution</h3>
-              <div className="build-actions">
-                <button
-                  type="button"
-                  onClick={() => handleBuild(false)}
-                  disabled={buildState.kind === "running" || isRunning}
-                >
-                  Check
-                </button>
-                <button
-                  type="button"
-                  onClick={() => handleBuild(true)}
-                  disabled={buildState.kind === "running" || isRunning}
-                >
-                  Build Release
-                </button>
-              </div>
-              <div className="build-actions">
-                <button
-                  type="button"
-                  onClick={handleTest}
-                  disabled={buildState.kind === "running" || isRunning}
-                >
-                  Test
-                </button>
-                {isRunning ? (
-                  <button
-                    type="button"
-                    onClick={handleStop}
-                    className="danger"
-                  >
-                    Stop
-                  </button>
-                ) : (
-                  <>
-                    <button
-                      type="button"
-                      onClick={handleRun}
-                      disabled={buildState.kind === "running"}
-                    >
-                      Run
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handleDebug}
-                      disabled={buildState.kind === "running"}
-                    >
-                      Debug
-                    </button>
-                  </>
-                )}
-              </div>
-              <div className="build-actions" style={{ marginTop: "0.5rem" }}>
-                <button
-                  type="button"
-                  onClick={handleSecurityAudit}
-                  className="btn-security-audit"
-                >
-                  🛡️ Security Audit
-                </button>
-              </div>
-              <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
-                <BuildBadge state={buildState} />
-                {isRunning && <span className="badge badge-ok">running</span>}
-              </div>
-              <div className="build-output">
-                {buildLines.map((line, i) => (
-                  <pre key={i}>{line}</pre>
-                ))}
-                <div ref={linesEndRef} />
-              </div>
-            </div>
+
           </aside>
 
-          <main className="studio-canvas" style={{ position: "relative" }} onPointerMove={onCanvasPointerMove}>
-            <ReactFlow<Node<NodeData>>
-              nodes={displayNodes}
-              edges={displayEdges}
-              nodeTypes={{ entryPoint: EntryPointNode, studio: StudioNode }}
-              onNodesChange={wrappedOnNodesChange}
-              onEdgesChange={wrappedOnEdgesChange}
-              onConnect={onConnect}
-              onNodeDoubleClick={onNodeDoubleClick}
-              onDragOver={onDragOver}
-              onDrop={onDrop}
-              onNodeDrag={onNodeDrag}
-              fitView
-              nodesDraggable={!proposedGraph}
-              nodesConnectable={!proposedGraph}
-              elementsSelectable={!proposedGraph}
-              deleteKeyCode={proposedGraph ? [] : ["Backspace", "Delete"]}
-            >
-              <Background />
-              <Controls />
-              <MiniMap pannable zoomable />
-            </ReactFlow>
+          <main className="studio-canvas" style={{ position: "relative", display: "flex", flexDirection: "column" }} onPointerMove={onCanvasPointerMove}>
+            <div style={{ flex: 1, position: "relative", minHeight: 0 }}>
+              <ReactFlow<Node<NodeData>>
+                nodes={displayNodes}
+                edges={displayEdges}
+                nodeTypes={{ entryPoint: EntryPointNode, studio: StudioNode }}
+                onNodesChange={wrappedOnNodesChange}
+                onEdgesChange={wrappedOnEdgesChange}
+                onConnect={onConnect}
+                onNodeDoubleClick={onNodeDoubleClick}
+                onDragOver={onDragOver}
+                onDrop={onDrop}
+                onNodeDrag={onNodeDrag}
+                onNodeDragStop={onNodeDragStop}
+                fitView
+                nodesDraggable={!proposedGraph}
+                nodesConnectable={!proposedGraph}
+                elementsSelectable={!proposedGraph}
+                deleteKeyCode={proposedGraph ? [] : ["Backspace", "Delete"]}
+              >
+                <Background />
+                <Controls />
+                <MiniMap pannable zoomable />
+              </ReactFlow>
 
-            <CursorsOverlay cursors={cursors} collaborators={collaborators} />
+              <CursorsOverlay cursors={cursors} collaborators={collaborators} />
 
-            {debugModeActive && (
-              <div className="premium-debugger-bar">
-                <div className="debugger-status">
-                  <span className={`pulse-indicator ${debugPausedNodeId ? "paused" : "running"}`}></span>
-                  {debugPausedNodeId ? (
-                    <span>Paused at Node: <strong>{displayNodes.find(n => n.id === debugPausedNodeId)?.data.label || debugPausedNodeId}</strong></span>
-                  ) : (
-                    <span>Debugger Executing...</span>
-                  )}
+              {debugModeActive && (
+                <div className="premium-debugger-bar">
+                  <div className="debugger-status">
+                    <span className={`pulse-indicator ${debugPausedNodeId ? "paused" : "running"}`}></span>
+                    {debugPausedNodeId ? (
+                      <span>Paused at Node: <strong>{displayNodes.find(n => n.id === debugPausedNodeId)?.data.label || debugPausedNodeId}</strong></span>
+                    ) : (
+                      <span>Debugger Executing...</span>
+                    )}
+                  </div>
+                  <div className="debugger-divider"></div>
+                  <div className="debugger-controls">
+                    <button
+                      type="button"
+                      className="btn-control resume"
+                      disabled={!debugPausedNodeId}
+                      onClick={() => import("../api").then(({ sendDebugAction }) => sendDebugAction(slug, "resume"))}
+                      title="Resume / Continue (F8)"
+                    >
+                      ▶ Resume
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-control step"
+                      disabled={!debugPausedNodeId}
+                      onClick={() => import("../api").then(({ sendDebugAction }) => sendDebugAction(slug, "step"))}
+                      title="Step Over (F10)"
+                    >
+                      ➔ Step Over
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-control stop"
+                      onClick={handleStop}
+                      title="Stop (Esc)"
+                    >
+                      ■ Stop
+                    </button>
+                  </div>
                 </div>
-                <div className="debugger-divider"></div>
-                <div className="debugger-controls">
+              )}
+            </div>
+
+            {/* Premium Fixed Bottom Console Drawer */}
+            <div className={`studio-console-panel ${isConsoleCollapsed ? "collapsed" : ""}`}>
+              <div className="studio-console-header" onClick={() => setIsConsoleCollapsed(!isConsoleCollapsed)}>
+                <div className="studio-console-title-group">
+                  <span className="studio-console-toggle-icon" style={{ fontSize: "0.7rem", color: "#818cf8" }}>
+                    {isConsoleCollapsed ? "▲" : "▼"}
+                  </span>
+                  <span className="studio-console-title">Console Output Logs</span>
+                  <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
+                    <BuildBadge state={buildState} />
+                    {isRunning && <span className="badge badge-ok">running</span>}
+                  </div>
+                </div>
+                <div className="studio-console-actions" onClick={(e) => e.stopPropagation()}>
                   <button
                     type="button"
-                    className="btn-control resume"
-                    disabled={!debugPausedNodeId}
-                    onClick={() => import("../api").then(({ sendDebugAction }) => sendDebugAction(slug, "resume"))}
-                    title="Resume / Continue (F8)"
+                    className="btn-console-action"
+                    onClick={() => setBuildLines([])}
+                    title="Clear console logs"
                   >
-                    ▶ Resume
+                    🗑️ Clear Logs
                   </button>
                   <button
                     type="button"
-                    className="btn-control step"
-                    disabled={!debugPausedNodeId}
-                    onClick={() => import("../api").then(({ sendDebugAction }) => sendDebugAction(slug, "step"))}
-                    title="Step Over (F10)"
+                    className="btn-console-action"
+                    onClick={() => setIsConsoleCollapsed(!isConsoleCollapsed)}
                   >
-                    ➔ Step Over
-                  </button>
-                  <button
-                    type="button"
-                    className="btn-control stop"
-                    onClick={handleStop}
-                    title="Stop (Esc)"
-                  >
-                    ■ Stop
+                    {isConsoleCollapsed ? "Expand" : "Collapse"}
                   </button>
                 </div>
               </div>
-            )}
+              
+              {!isConsoleCollapsed && (
+                <div className="studio-console-body">
+                  {buildLines.length === 0 ? (
+                    <div style={{ opacity: 0.4, fontStyle: "italic", fontSize: "0.75rem", padding: "0.5rem 0" }}>
+                      No logs. Click "Check", "Run", "Debug", or "Test" to execute.
+                    </div>
+                  ) : (
+                    buildLines.map((line, i) => <pre key={i}>{line}</pre>)
+                  )}
+                  <div ref={linesEndRef} />
+                </div>
+              )}
+            </div>
           </main>
 
           {selectedNode && (
@@ -1787,6 +2322,7 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
               diagnostics={diagnostics.filter((d) => d.node_id === selectedNode.id)}
               onChange={(config) => updateNodeConfig(selectedNode.id, config)}
               onClose={() => setSelectedNodeId(null)}
+              onDelete={() => deleteNode(selectedNode.id)}
             />
           )}
  

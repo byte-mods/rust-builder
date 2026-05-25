@@ -45,6 +45,15 @@ pub enum ApiError {
     #[error("already exists")]
     AlreadyExists,
 
+    /// The request is well-formed but its precondition against the current
+    /// resource state cannot be satisfied (e.g. deleting the root package
+    /// of a project, or creating a child package whose slug collides with
+    /// an existing sibling). Carries the reason for the server log; the
+    /// client sees a sanitised message under the `conflict` error code.
+    /// Status: 409.
+    #[error("conflict: {0}")]
+    Conflict(String),
+
     /// The slug field failed validation. Carries the validation reason for
     /// the server log; the client sees a generic human message.
     #[error("invalid slug: {0}")]
@@ -119,6 +128,11 @@ impl ApiError {
                 StatusCode::CONFLICT,
                 "already_exists",
                 "a resource with that identifier already exists",
+            ),
+            ApiError::Conflict(_) => (
+                StatusCode::CONFLICT,
+                "conflict",
+                "the request conflicts with the current state of the resource",
             ),
             ApiError::InvalidSlug(_) => (
                 StatusCode::UNPROCESSABLE_ENTITY,

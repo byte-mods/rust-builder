@@ -643,6 +643,7 @@ async fn test_deferred_codegen_e2e_flow() {
 
 #[tokio::test]
 async fn test_llm_endpoints_return_api_key_missing_when_env_not_set() {
+    std::env::set_var("RUST_NO_CODE_TEST", "true");
     let (app, _dir) = harness().await;
 
     // First ensure project is created
@@ -742,11 +743,14 @@ async fn test_step_debugger_lifecycle() {
         ]
     });
 
-    // Write the graph.json directly to disk to bypass the multiplicity validation check
+    // Write the graph directly to disk to bypass the multiplicity
+    // validation check. T2 relocated graphs from `<proj>/graph.json` to
+    // `<proj>/packages/main/graph.json`; the bypass path follows.
     let project_dir = dir.path().join("debug-e2e");
-    tokio::fs::create_dir_all(&project_dir).await.unwrap();
+    let pkg_dir = project_dir.join("packages").join("main");
+    tokio::fs::create_dir_all(&pkg_dir).await.unwrap();
     tokio::fs::write(
-        project_dir.join("graph.json"),
+        pkg_dir.join("graph.json"),
         serde_json::to_string(&graph).unwrap(),
     )
     .await
@@ -1159,6 +1163,704 @@ async fn test_grpc_scaffolder_pipeline() {
     assert!(cargo_toml_src.contains("[build-dependencies]"));
     assert!(cargo_toml_src.contains("tonic-build = \"0.10\""));
 }
+
+#[tokio::test]
+async fn test_marketplace_lifecycle() {
+    let (app, dir) = harness().await;
+
+    // 1. Create a project
+    let (status, _) = send_json(
+        app.clone(),
+        Method::POST,
+        "/api/projects",
+        Some(&json!({"slug": "market-test", "name": "Marketplace Test"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // 2. GET marketplace state — should be empty initially
+    let (status, body) = send_json(
+        app.clone(),
+        Method::GET,
+        "/api/projects/market-test/marketplace",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_array().unwrap().len(), 0);
+
+    // 3. Install a marketplace package (ScyllaDB)
+    let (status, body) = send_json(
+        app.clone(),
+        Method::POST,
+        "/api/projects/market-test/marketplace/install",
+        Some(&json!({"package": "scylla"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let list = body.as_array().unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].as_str().unwrap(), "scylla");
+
+    // 4. Trigger regen code generation
+    let (status, _) = send_json(
+        app.clone(),
+        Method::POST,
+        "/api/projects/market-test/regen",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // 5. Verify Cargo.toml contains ScyllaDB dependency
+    let cargo_toml_path = dir.path().join("market-test/Cargo.toml");
+    assert!(cargo_toml_path.exists());
+    let cargo_toml_src = std::fs::read_to_string(&cargo_toml_path).unwrap();
+    assert!(cargo_toml_src.contains("scylla = \"0.10.0\""));
+
+    // 6. Uninstall ScyllaDB package
+    let (status, body) = send_json(
+        app.clone(),
+        Method::POST,
+        "/api/projects/market-test/marketplace/uninstall",
+        Some(&json!({"package": "scylla"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_array().unwrap().len(), 0);
+
+    // 7. Trigger regen again
+    let (status, _) = send_json(
+        app.clone(),
+        Method::POST,
+        "/api/projects/market-test/regen",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // 8. Verify Cargo.toml no longer contains ScyllaDB dependency
+    let cargo_toml_src = std::fs::read_to_string(&cargo_toml_path).unwrap();
+    assert!(!cargo_toml_src.contains("scylla = \"0.10.0\""));
+}
+
+#[tokio::test]
+async fn test_actix_http_server_and_middleware_generation() {
+    let (app, dir) = harness().await;
+
+    // 1. Create actix-test project
+    let (status, _) = send_json(
+        app.clone(),
+        Method::POST,
+        "/api/projects",
+        Some(&json!({"slug": "actix-test", "name": "Actix Test"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // 2. Build a high-fidelity visual graph containing actix entry, middleware, and handler
+    let graph = json!({
+        "schema_version": 1,
+        "nodes": [
+            {
+                "id": "entry",
+                "template_id": "core.entry_point",
+                "position": {"x": 100, "y": 100},
+                "config": {
+                    "bind_address": "127.0.0.1:9090",
+                    "log_level": "info",
+                    "framework": "actix",
+                    "workers": 4,
+                    "max_connections": 100,
+                    "keep_alive_seconds": 15
+                }
+            },
+            {
+                "id": "route",
+                "template_id": "http.route",
+                "position": {"x": 300, "y": 100},
+                "config": {
+                    "path": "/greet",
+                    "method": "GET"
+                }
+            },
+            {
+                "id": "mw",
+                "template_id": "http.middleware",
+                "position": {"x": 500, "y": 100},
+                "config": {
+                    "name": "logger_mw",
+                    "body": "    let res = next.call(req).await?;\n    Ok(res)"
+                }
+            },
+            {
+                "id": "handler",
+                "template_id": "http.handler",
+                "position": {"x": 700, "y": 100},
+                "config": {
+                    "name": "greet_handler"
+                }
+            }
+        ],
+        "edges": [
+            {
+                "id": "e1",
+                "source": "entry",
+                "source_port": "http",
+                "target": "route",
+                "target_port": "entry"
+            },
+            {
+                "id": "e2",
+                "source": "route",
+                "source_port": "request",
+                "target": "mw",
+                "target_port": "request"
+            },
+            {
+                "id": "e3",
+                "source": "mw",
+                "source_port": "handler",
+                "target": "handler",
+                "target_port": "request"
+            }
+        ]
+    });
+
+    // 3. Save graph
+    let (status, _) = send_json(
+        app.clone(),
+        Method::PUT,
+        "/api/projects/actix-test/graph",
+        Some(&graph),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // 4. Trigger codegen regeneration
+    let (status, _) = send_json(
+        app.clone(),
+        Method::POST,
+        "/api/projects/actix-test/regen",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let proj_root = dir.path().join("actix-test");
+
+    // 5. Assert Cargo.toml has Actix dependencies and does NOT contain Axum
+    let cargo_src = std::fs::read_to_string(proj_root.join("Cargo.toml")).unwrap();
+    assert!(cargo_src.contains("actix-web = \"4\""), "Cargo.toml must have actix-web");
+    assert!(cargo_src.contains("actix-web-lab = \"0.20\""), "Cargo.toml must have actix-web-lab");
+    assert!(!cargo_src.contains("axum = "), "Cargo.toml must not contain axum");
+
+    // 6. Assert main.rs mounts Actix server and configures socket/worker rules
+    let main_src = std::fs::read_to_string(proj_root.join("src/main.rs")).unwrap();
+    assert!(main_src.contains("#[actix_web::main]"), "main.rs must have actix entry");
+    assert!(main_src.contains(".workers(4)"), "main.rs must override workers");
+    assert!(main_src.contains(".max_connections(100)"), "main.rs must override max_connections");
+    assert!(main_src.contains(".keep_alive(std::time::Duration::from_secs(15))"), "main.rs must override keep-alive");
+    assert!(main_src.contains("actix_test::configure_routes"), "main.rs must configure routes");
+
+    // 7. Assert lib.rs has configure_routes function wrapping sequential middlewares
+    let lib_src = std::fs::read_to_string(proj_root.join("src/lib.rs")).unwrap();
+    assert!(lib_src.contains("pub fn configure_routes"), "lib.rs must configure routes fn");
+    assert!(lib_src.contains("wrap(actix_web_lab::middleware::from_fn(middlewares::logger_mw::logger_mw))"), "lib.rs must wrap middleware");
+    assert!(lib_src.contains("to(handlers::greet_handler::greet_handler)"), "lib.rs must map route to handler");
+
+    // 8. Assert custom middleware is successfully emitted
+    let mw_src = std::fs::read_to_string(proj_root.join("src/middlewares/logger_mw.rs")).unwrap();
+    assert!(mw_src.contains("pub async fn logger_mw"), "middleware fn name check");
+    assert!(mw_src.contains("req: ServiceRequest"), "middleware req type check");
+    assert!(mw_src.contains("next: Next"), "middleware next type check");
+    assert!(mw_src.contains("let res = next.call(req).await?;"), "middleware body check");
+
+    // 9. Assert custom handler has Actix Responder signature
+    let handler_src = std::fs::read_to_string(proj_root.join("src/handlers/greet_handler.rs")).unwrap();
+    assert!(handler_src.contains("Result<impl Responder, AppError>"), "handler responder signature check");
+
+    // 10. Assert AppError implements Actix ResponseError
+    let err_src = std::fs::read_to_string(proj_root.join("src/errors.rs")).unwrap();
+    assert!(err_src.contains("impl ResponseError for AppError"), "errors must implement ResponseError");
+}
+
+#[tokio::test]
+async fn test_ecommerce_template_generation() {
+    let (app, dir) = harness().await;
+
+    // 1. Create the project with "ecommerce" template
+    let (status, body) = send_json(
+        app.clone(),
+        Method::POST,
+        "/api/projects",
+        Some(&json!({
+            "slug": "ecommerce-test",
+            "name": "ECommerce Test",
+            "template": "ecommerce"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["slug"].as_str().unwrap(), "ecommerce-test");
+
+    // 2. Verify marketplace packages are pre-installed
+    let proj_root = dir.path().join("ecommerce-test");
+    let marketplace_src = std::fs::read_to_string(proj_root.join("marketplace.json")).unwrap();
+    let packages: Vec<String> = serde_json::from_str(&marketplace_src).unwrap();
+    assert!(packages.contains(&"mongodb".to_string()));
+    assert!(packages.contains(&"redis".to_string()));
+
+    // 3. Verify graph.json has routes, middlewares, and custom handlers.
+    // T2 moved the graph file from the project root to
+    // `packages/main/graph.json` to support nested-package projects.
+    let graph_src = std::fs::read_to_string(
+        proj_root.join("packages").join("main").join("graph.json"),
+    )
+    .unwrap();
+    let graph: serde_json::Value = serde_json::from_str(&graph_src).unwrap();
+    let nodes = graph["nodes"].as_array().unwrap();
+    
+    // Assert key nodes exist
+    assert!(nodes.iter().any(|n| n["id"].as_str() == Some("entry")));
+    assert!(nodes.iter().any(|n| n["id"].as_str() == Some("mongodb_client")));
+    assert!(nodes.iter().any(|n| n["id"].as_str() == Some("redis_client")));
+    assert!(nodes.iter().any(|n| n["id"].as_str() == Some("db_helper")));
+    assert!(nodes.iter().any(|n| n["id"].as_str() == Some("route_signup")));
+    assert!(nodes.iter().any(|n| n["id"].as_str() == Some("handler_signup")));
+    assert!(nodes.iter().any(|n| n["id"].as_str() == Some("mw_create_order")));
+
+    // 4. Trigger code generation
+    let (status, body) = send_json(
+        app.clone(),
+        Method::POST,
+        "/api/projects/ecommerce-test/regen",
+        None,
+    )
+    .await;
+    if status != StatusCode::OK {
+        panic!("Regen failed with status {}! Error body: {:#?}", status, body);
+    }
+
+    // 5. Verify Cargo.toml contains all template-seeded and framework dependencies
+    let cargo_src = std::fs::read_to_string(proj_root.join("Cargo.toml")).unwrap();
+    assert!(cargo_src.contains("actix-web = \"4\""));
+    assert!(cargo_src.contains("mongodb = \"2.8.0\""));
+    assert!(cargo_src.contains("redis = { version = \"0.25\", features = [\"tokio-comp\"] }"));
+    assert!(cargo_src.contains("once_cell = \"1.18\""));
+    assert!(cargo_src.contains("bcrypt = \"0.15\""));
+    assert!(cargo_src.contains("jsonwebtoken = \"9.2\""));
+
+    // 6. Verify main.rs bootstraps actix-web listening
+    let main_src = std::fs::read_to_string(proj_root.join("src/main.rs")).unwrap();
+    assert!(main_src.contains("#[actix_web::main]"));
+    assert!(main_src.contains("ecommerce_test::configure_routes"));
+
+    // 7. Verify helper db connection pool file is emitted
+    let db_helper_src = std::fs::read_to_string(proj_root.join("src/handlers/db_helper.rs")).unwrap();
+    assert!(db_helper_src.contains("pub static MONGO: Lazy<OnceCell<Client>>"));
+    assert!(db_helper_src.contains("pub static REDIS: Lazy<OnceCell<redis::Client>>"));
+
+    // 8. Verify custom handler codes are successfully written verbatim
+    let signup_src = std::fs::read_to_string(proj_root.join("src/handlers/signup.rs")).unwrap();
+    assert!(signup_src.contains("pub async fn signup("));
+    assert!(signup_src.contains("bcrypt::hash("));
+
+    let order_src = std::fs::read_to_string(proj_root.join("src/handlers/create_order.rs")).unwrap();
+    assert!(order_src.contains("pub async fn create_order("));
+    assert!(order_src.contains("session.start_transaction("));
+    assert!(order_src.contains("session.commit_transaction("));
+    assert!(order_src.contains("retries -= 1")); // write conflict retry check
+
+    // 9. Verify lib.rs routes configuration splicing with wrap middlewares
+    let lib_src = std::fs::read_to_string(proj_root.join("src/lib.rs")).unwrap();
+    assert!(lib_src.contains("pub fn configure_routes("));
+    assert!(lib_src.contains(".wrap(actix_web_lab::middleware::from_fn(middlewares::auth_mw_create_order::auth_mw_create_order))"));
+}
+
+// ----- T3: Package CRUD HTTP endpoints -----
+
+/// Helper: create a project named `slug` so package-CRUD tests have
+/// something to attach to. Returns the parsed project body.
+async fn create_test_project(app: Router, slug: &str) -> Value {
+    let (status, body) = send_json(
+        app,
+        Method::POST,
+        "/api/projects",
+        Some(&json!({"slug": slug, "name": slug})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create_test_project failed: {body}");
+    body
+}
+
+#[tokio::test]
+async fn test_list_packages_returns_root_after_create() {
+    let (app, _dir) = harness().await;
+    create_test_project(app.clone(), "pkgs-list").await;
+
+    let (status, body) = send_json(
+        app,
+        Method::GET,
+        "/api/projects/pkgs-list/packages",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let packages = body["packages"].as_array().unwrap();
+    assert_eq!(packages.len(), 1, "new project ships with exactly one (root) package");
+    assert_eq!(packages[0]["slug"], "main");
+    assert!(packages[0]["parent_id"].is_null());
+}
+
+#[tokio::test]
+async fn test_post_packages_creates_child_under_root_by_default() {
+    let (app, _dir) = harness().await;
+    create_test_project(app.clone(), "pkgs-child").await;
+
+    let (status, body) = send_json(
+        app.clone(),
+        Method::POST,
+        "/api/projects/pkgs-child/packages",
+        Some(&json!({"slug": "auth"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["slug"], "auth");
+    // Server-minted id; never an empty string.
+    let id = body["id"].as_str().expect("id present");
+    assert!(id.starts_with("pkg-") && id.len() > "pkg-".len());
+
+    // Tree reflects two packages now.
+    let (_, list_body) = send_json(
+        app,
+        Method::GET,
+        "/api/projects/pkgs-child/packages",
+        None,
+    )
+    .await;
+    assert_eq!(list_body["packages"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn test_post_packages_rejects_sibling_slug_collision_with_409() {
+    let (app, _dir) = harness().await;
+    create_test_project(app.clone(), "pkgs-dup").await;
+
+    let (s1, _) = send_json(
+        app.clone(),
+        Method::POST,
+        "/api/projects/pkgs-dup/packages",
+        Some(&json!({"slug": "auth"})),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::CREATED);
+
+    let (s2, body) = send_json(
+        app,
+        Method::POST,
+        "/api/projects/pkgs-dup/packages",
+        Some(&json!({"slug": "auth"})),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "conflict");
+}
+
+#[tokio::test]
+async fn test_post_packages_rejects_unknown_parent_id_with_404() {
+    let (app, _dir) = harness().await;
+    create_test_project(app.clone(), "pkgs-orphan").await;
+
+    let (status, body) = send_json(
+        app,
+        Method::POST,
+        "/api/projects/pkgs-orphan/packages",
+        Some(&json!({"slug": "child", "parent_id": "pkg-ghost"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"], "not_found");
+}
+
+#[tokio::test]
+async fn test_delete_root_package_returns_409() {
+    let (app, _dir) = harness().await;
+    create_test_project(app.clone(), "pkgs-root").await;
+
+    let (status, body) = send_json(
+        app,
+        Method::DELETE,
+        "/api/projects/pkgs-root/packages/main",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "conflict");
+}
+
+#[tokio::test]
+async fn test_delete_leaf_package_removes_disk_folder() {
+    let (app, dir) = harness().await;
+    create_test_project(app.clone(), "pkgs-del").await;
+
+    // Add a child + put a graph in it.
+    let (_, _) = send_json(
+        app.clone(),
+        Method::POST,
+        "/api/projects/pkgs-del/packages",
+        Some(&json!({"slug": "scratch"})),
+    )
+    .await;
+    let (put_status, _) = send_json(
+        app.clone(),
+        Method::PUT,
+        "/api/projects/pkgs-del/packages/scratch/graph",
+        Some(&json!({"schema_version": 1, "nodes": [], "edges": []})),
+    )
+    .await;
+    assert_eq!(put_status, StatusCode::OK);
+    let pkg_dir = dir.path().join("pkgs-del").join("packages").join("scratch");
+    assert!(pkg_dir.exists());
+
+    let (del_status, _) = send_json(
+        app,
+        Method::DELETE,
+        "/api/projects/pkgs-del/packages/scratch",
+        None,
+    )
+    .await;
+    assert_eq!(del_status, StatusCode::NO_CONTENT);
+    assert!(!pkg_dir.exists(), "leaf delete must remove disk folder");
+}
+
+#[tokio::test]
+async fn test_delete_non_leaf_cascades_to_descendants() {
+    let (app, dir) = harness().await;
+    create_test_project(app.clone(), "pkgs-tree").await;
+
+    // Build tree: root → mid → leaf
+    let (_, mid_body) = send_json(
+        app.clone(),
+        Method::POST,
+        "/api/projects/pkgs-tree/packages",
+        Some(&json!({"slug": "mid"})),
+    )
+    .await;
+    let mid_id = mid_body["id"].as_str().unwrap();
+    let (_, _) = send_json(
+        app.clone(),
+        Method::POST,
+        "/api/projects/pkgs-tree/packages",
+        Some(&json!({"slug": "leaf", "parent_id": mid_id})),
+    )
+    .await;
+
+    // Seed graph files for both so the disk-cleanup path is exercised.
+    for child in ["mid", "leaf"] {
+        let (s, _) = send_json(
+            app.clone(),
+            Method::PUT,
+            &format!("/api/projects/pkgs-tree/packages/{child}/graph"),
+            Some(&json!({"schema_version": 1, "nodes": [], "edges": []})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+    }
+
+    // Delete `mid` — `leaf` must vanish along with it.
+    let (del_status, _) = send_json(
+        app.clone(),
+        Method::DELETE,
+        "/api/projects/pkgs-tree/packages/mid",
+        None,
+    )
+    .await;
+    assert_eq!(del_status, StatusCode::NO_CONTENT);
+
+    let proj_root = dir.path().join("pkgs-tree");
+    assert!(!proj_root.join("packages").join("mid").exists());
+    assert!(!proj_root.join("packages").join("leaf").exists());
+    assert!(proj_root.join("packages").join("main").exists(), "root untouched");
+
+    let (_, list_body) = send_json(
+        app,
+        Method::GET,
+        "/api/projects/pkgs-tree/packages",
+        None,
+    )
+    .await;
+    assert_eq!(list_body["packages"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_patch_package_rename_moves_disk_folder_preserving_graph() {
+    let (app, dir) = harness().await;
+    create_test_project(app.clone(), "pkgs-mv").await;
+
+    let (_, _) = send_json(
+        app.clone(),
+        Method::POST,
+        "/api/projects/pkgs-mv/packages",
+        Some(&json!({"slug": "before"})),
+    )
+    .await;
+    // Put a recognisable graph.
+    let graph = json!({
+        "schema_version": 1,
+        "nodes": [],
+        "edges": []
+    });
+    let (s, _) = send_json(
+        app.clone(),
+        Method::PUT,
+        "/api/projects/pkgs-mv/packages/before/graph",
+        Some(&graph),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    // Rename.
+    let (patch_status, patch_body) = send_json(
+        app.clone(),
+        Method::PATCH,
+        "/api/projects/pkgs-mv/packages/before",
+        Some(&json!({"slug": "after"})),
+    )
+    .await;
+    assert_eq!(patch_status, StatusCode::OK);
+    assert_eq!(patch_body["slug"], "after");
+
+    // Disk moved.
+    let proj_root = dir.path().join("pkgs-mv");
+    assert!(!proj_root.join("packages").join("before").exists());
+    assert!(proj_root.join("packages").join("after").join("graph.json").exists());
+
+    // Graph still readable via the new slug.
+    let (g_status, _) = send_json(
+        app,
+        Method::GET,
+        "/api/projects/pkgs-mv/packages/after/graph",
+        None,
+    )
+    .await;
+    assert_eq!(g_status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_patch_rename_to_sibling_slug_returns_409() {
+    let (app, _dir) = harness().await;
+    create_test_project(app.clone(), "pkgs-rn-dup").await;
+
+    for s in ["alpha", "beta"] {
+        let (st, _) = send_json(
+            app.clone(),
+            Method::POST,
+            "/api/projects/pkgs-rn-dup/packages",
+            Some(&json!({"slug": s})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED);
+    }
+
+    let (status, body) = send_json(
+        app,
+        Method::PATCH,
+        "/api/projects/pkgs-rn-dup/packages/alpha",
+        Some(&json!({"slug": "beta"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "conflict");
+}
+
+#[tokio::test]
+async fn test_put_then_get_package_graph_round_trips() {
+    let (app, _dir) = harness().await;
+    create_test_project(app.clone(), "pkgs-graph").await;
+    let (_, _) = send_json(
+        app.clone(),
+        Method::POST,
+        "/api/projects/pkgs-graph/packages",
+        Some(&json!({"slug": "billing"})),
+    )
+    .await;
+
+    let graph = json!({"schema_version": 1, "nodes": [], "edges": []});
+    let (put_s, _) = send_json(
+        app.clone(),
+        Method::PUT,
+        "/api/projects/pkgs-graph/packages/billing/graph",
+        Some(&graph),
+    )
+    .await;
+    assert_eq!(put_s, StatusCode::OK);
+
+    let (get_s, get_body) = send_json(
+        app,
+        Method::GET,
+        "/api/projects/pkgs-graph/packages/billing/graph",
+        None,
+    )
+    .await;
+    assert_eq!(get_s, StatusCode::OK);
+    assert_eq!(get_body["schema_version"], 1);
+}
+
+#[tokio::test]
+async fn test_regen_emits_nested_package_modules_end_to_end() {
+    // Full flow: create project → create child package → POST regen →
+    // verify the source tree has the nested mod.rs and the root lib.rs
+    // declares the child. Critical E2E for T4 because the HTTP layer
+    // had to be wired (load every package's graph and pass them in).
+    let (app, dir) = harness().await;
+    create_test_project(app.clone(), "regen-multi").await;
+
+    let (create_st, _) = send_json(
+        app.clone(),
+        Method::POST,
+        "/api/projects/regen-multi/packages",
+        Some(&json!({"slug": "billing"})),
+    )
+    .await;
+    assert_eq!(create_st, StatusCode::CREATED);
+
+    let (regen_st, regen_body) = send_json(
+        app,
+        Method::POST,
+        "/api/projects/regen-multi/regen",
+        None,
+    )
+    .await;
+    assert_eq!(regen_st, StatusCode::OK, "regen failed with body: {regen_body}");
+
+    let proj_root = dir.path().join("regen-multi");
+    let child_mod = proj_root.join("src").join("billing").join("mod.rs");
+    assert!(child_mod.exists(), "regen must produce nested package mod.rs");
+
+    let lib_src = std::fs::read_to_string(proj_root.join("src/lib.rs")).unwrap();
+    assert!(
+        lib_src.contains("pub mod billing;"),
+        "root lib.rs must declare child package; got:\n{lib_src}"
+    );
+}
+
+#[tokio::test]
+async fn test_put_package_graph_for_unknown_package_returns_404() {
+    let (app, _dir) = harness().await;
+    create_test_project(app.clone(), "pkgs-404").await;
+
+    let (status, _) = send_json(
+        app,
+        Method::PUT,
+        "/api/projects/pkgs-404/packages/ghost/graph",
+        Some(&json!({"schema_version": 1, "nodes": [], "edges": []})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+
 
 
 

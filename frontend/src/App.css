@@ -13,6 +13,7 @@ html, body, #root {
   display: flex;
   flex-direction: column;
   height: 100vh;
+  overflow: hidden;
 }
 
 .studio-header {
@@ -161,14 +162,12 @@ html, body, #root {
   flex: 1;
   display: flex;
   min-height: 0;
+  overflow: hidden;
 }
 
 .node-palette {
-  width: 240px;
-  flex-shrink: 0;
-  overflow-y: auto;
+  width: 100%;
   padding: 0.75rem 0.9rem;
-  border-right: 1px solid rgba(127, 127, 127, 0.18);
   font-size: 0.85rem;
 }
 .node-palette h2 {
@@ -219,6 +218,23 @@ html, body, #root {
   flex-direction: column;
   border-right: 1px solid rgba(127, 127, 127, 0.18);
   min-height: 0;
+  max-height: 100%;
+  overflow-y: auto;
+}
+
+/* Custom premium scrollbar for sidebar */
+.project-sidebar::-webkit-scrollbar {
+  width: 6px;
+}
+.project-sidebar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.project-sidebar::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+}
+.project-sidebar::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
 }
 
 .build-panel {
@@ -2888,3 +2904,366 @@ body {
   color: white !important;
   box-shadow: 0 0 10px rgba(167, 139, 250, 0.3);
 }
+
+/* Overrides to guarantee high-contrast readable text during dragging operations */
+.react-flow__node.dragging {
+  background: rgba(30, 41, 59, 0.95) !important;
+  border-radius: 8px !important;
+  border: 1.5px solid #6366f1 !important;
+  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 10px 10px -5px rgba(0, 0, 0, 0.4) !important;
+  opacity: 0.95 !important;
+}
+
+.react-flow__node.dragging .studio-node,
+.studio-node.dragging {
+  background: rgba(15, 23, 42, 0.98) !important;
+  color: #f8fafc !important;
+  border-color: #6366f1 !important;
+  opacity: 1 !important;
+}
+
+.react-flow__node.dragging .entry-point-node,
+.entry-point-node.dragging {
+  background: rgba(15, 23, 42, 0.98) !important;
+  color: #f8fafc !important;
+  border-color: #f43f5e !important;
+  opacity: 1 !important;
+}
+
+.react-flow__node.dragging *,
+.studio-node.dragging *,
+.entry-point-node.dragging * {
+  color: #f8fafc !important;
+}
+
+.react-flow__node.dragging .port-type,
+.studio-node.dragging .port-type,
+.entry-point-node.dragging .port-type {
+  color: #a78bfa !important;
+}
+
+.react-flow__node.dragging .node-header,
+.studio-node.dragging .node-header,
+.entry-point-node.dragging .node-header {
+  background: linear-gradient(135deg, #4f46e5 0%, #3730a3 100%) !important;
+  color: white !important;
+}
+
+.react-flow__node.dragging .node-header-title *,
+.studio-node.dragging .node-header-title *,
+.entry-point-node.dragging .node-header-title * {
+  color: white !important;
+}
+
+.react-flow__node.dragging .node-performance-pill *,
+.studio-node.dragging .node-performance-pill *,
+.entry-point-node.dragging .node-performance-pill * {
+  color: #38bdf8 !important;
+}
+
+/* S20 Premium Save Status & Manual Save Badge styles */
+.save-status-container {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: rgba(30, 41, 59, 0.45);
+  padding: 4px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  backdrop-filter: blur(8px);
+}
+
+.save-status-badge {
+  font-size: 0.72rem;
+  font-weight: 500;
+  padding: 3px 8px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.save-status-badge.saved {
+  color: #4ade80;
+  background: rgba(74, 222, 128, 0.1);
+  border: 1px solid rgba(74, 222, 128, 0.15);
+}
+
+.save-status-badge.saving {
+  color: #fbbf24;
+  background: rgba(251, 191, 36, 0.1);
+  border: 1px solid rgba(251, 191, 36, 0.15);
+  animation: pulse-saving 1.5s infinite ease-in-out;
+}
+
+.save-status-badge.unsaved {
+  color: #c084fc;
+  background: rgba(192, 132, 252, 0.15);
+  border: 1px solid rgba(192, 132, 252, 0.25);
+  animation: pulse-unsaved 2.5s infinite ease-in-out;
+}
+
+.save-status-badge.error {
+  color: #f87171;
+  background: rgba(248, 113, 113, 0.1);
+  border: 1px solid rgba(248, 113, 113, 0.15);
+}
+
+@keyframes pulse-saving {
+  0%, 100% { opacity: 0.8; }
+  50% { opacity: 1; transform: scale(1.02); }
+}
+
+@keyframes pulse-unsaved {
+  0%, 100% { opacity: 0.9; }
+  50% { opacity: 1; }
+}
+
+.btn-manual-save {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 12px !important;
+  border-radius: 6px !important;
+  font-size: 0.75rem !important;
+  font-weight: 600 !important;
+  cursor: pointer;
+  border: 1px solid #7c3aed !important;
+  background: linear-gradient(135deg, #7c3aed 0%, #6d28d9 100%) !important;
+  color: white !important;
+  box-shadow: 0 4px 12px rgba(124, 58, 237, 0.25) !important;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1) !important;
+}
+
+.btn-manual-save:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 15px rgba(124, 58, 237, 0.4) !important;
+  background: linear-gradient(135deg, #8b5cf6 0%, #7c3aed 100%) !important;
+}
+
+.btn-manual-save:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.btn-manual-save:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  background: rgba(71, 85, 105, 0.4) !important;
+  border-color: rgba(71, 85, 105, 0.2) !important;
+  box-shadow: none !important;
+  color: rgba(255, 255, 255, 0.4) !important;
+}
+
+/* ---- PREMIUM BOTTOM CONSOLE DRAWER STYLES -------------------------------- */
+.studio-console-panel {
+  height: 250px;
+  background: #09090f;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  display: flex;
+  flex-direction: column;
+  transition: height 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  overflow: hidden;
+  z-index: 10;
+}
+
+.studio-console-panel.collapsed {
+  height: 40px;
+}
+
+.studio-console-header {
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 1rem;
+  background: rgba(15, 15, 25, 0.9);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  cursor: pointer;
+  user-select: none;
+}
+
+.studio-console-title-group {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.studio-console-toggle-icon {
+  transition: transform 0.2s ease;
+}
+
+.studio-console-panel.collapsed .studio-console-toggle-icon {
+  transform: rotate(180deg);
+}
+
+.studio-console-title {
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #94a3b8;
+}
+
+.studio-console-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.btn-console-action {
+  background: rgba(255, 255, 255, 0.02) !important;
+  border: 1px solid rgba(255, 255, 255, 0.08) !important;
+  color: #94a3b8 !important;
+  font-size: 0.72rem !important;
+  padding: 3px 10px !important;
+  border-radius: 4px !important;
+  cursor: pointer !important;
+  transition: all 0.15s !important;
+  font-weight: 500 !important;
+}
+
+.btn-console-action:hover {
+  background: rgba(99, 102, 241, 0.1) !important;
+  color: white !important;
+  border-color: rgba(99, 102, 241, 0.3) !important;
+}
+
+.studio-console-body {
+  flex: 1;
+  padding: 0.75rem 1rem;
+  overflow-y: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.8rem;
+  background: #030305;
+  color: #a7f3d0;
+  box-shadow: inset 0 4px 12px rgba(0, 0, 0, 0.6);
+}
+
+.studio-console-body pre {
+  margin: 0 0 4px 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+  line-height: 1.45;
+}
+
+.studio-console-body::-webkit-scrollbar {
+  width: 6px;
+}
+.studio-console-body::-webkit-scrollbar-track {
+  background: transparent;
+}
+.studio-console-body::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+}
+.studio-console-body::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+/* ---- Premium Template Section Styles (S18) ------------------------------- */
+.template-section {
+  grid-column: span 2;
+  margin-top: 1rem;
+}
+
+.template-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 1.5rem;
+  margin-top: 1rem;
+}
+
+.template-card {
+  position: relative;
+  background: rgba(255, 255, 255, 0.02);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  padding: 1.25rem;
+  cursor: pointer;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  overflow: hidden;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);
+}
+
+.template-card:hover {
+  transform: translateY(-4px) scale(1.02);
+  background: rgba(255, 255, 255, 0.05);
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+.template-card.selected {
+  border-color: transparent;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.template-card-glow {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.template-card.selected .template-card-glow {
+  opacity: 0.15;
+}
+
+.template-card-content {
+  position: relative;
+  z-index: 1;
+}
+
+.template-header {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 0.75rem;
+}
+
+.template-icon {
+  font-size: 1.5rem;
+  padding: 0.3rem;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.template-title {
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin: 0;
+  color: #ffffff;
+}
+
+.template-desc {
+  font-size: 0.8rem;
+  line-height: 1.45;
+  color: rgba(255, 255, 255, 0.65);
+  margin-bottom: 1.25rem;
+}
+
+.template-tech-wrap {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.template-tech-tag {
+  font-size: 0.65rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  padding: 0.15rem 0.4rem;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(255, 255, 255, 0.85);
+  border: 1px solid rgba(255, 255, 255, 0.04);
+}
+

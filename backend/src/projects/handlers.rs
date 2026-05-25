@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::build::BuildVerb;
 use crate::codegen::{GenerateReport, Generator};
 use crate::error::ApiError;
-use crate::projects::{Graph, Project, ProjectMeta, Slug};
+use crate::projects::{Graph, Package, PackageId, PackageSlug, Project, ProjectMeta, Slug};
 use crate::projects::llm;
 use crate::AppState;
 use std::sync::Arc;
@@ -39,6 +39,19 @@ pub fn projects_router() -> Router<AppState> {
             "/projects/:slug/graph",
             get(get_graph).put(put_graph),
         )
+        // Package CRUD (Section 1 T3) — the project's package tree.
+        .route(
+            "/projects/:slug/packages",
+            get(list_packages).post(create_package),
+        )
+        .route(
+            "/projects/:slug/packages/:pkg",
+            axum::routing::patch(rename_package).delete(delete_package),
+        )
+        .route(
+            "/projects/:slug/packages/:pkg/graph",
+            get(get_package_graph).put(put_package_graph),
+        )
         .route("/projects/:slug/regen", post(regen_project))
         .route("/projects/:slug/build", post(build_project))
         .route("/projects/:slug/run", post(run_project))
@@ -53,6 +66,9 @@ pub fn projects_router() -> Router<AppState> {
         .route("/projects/:slug/export", get(export_project))
         .route("/projects/import", post(import_project))
         .route("/projects/:slug/db/schema", post(db_schema))
+        .route("/projects/:slug/marketplace", get(get_marketplace))
+        .route("/projects/:slug/marketplace/install", post(install_marketplace_package))
+        .route("/projects/:slug/marketplace/uninstall", post(uninstall_marketplace_package))
 }
 
 /// Request body for `POST /api/projects`. `slug` deserialises through the
@@ -64,6 +80,8 @@ struct CreateProjectBody {
     /// Human-readable name. Currently unconstrained except by JSON's own
     /// limits; the studio surfaces it verbatim in the UI list.
     name: String,
+    /// Optional template identifier to seed the initial graph
+    template: Option<String>,
 }
 
 /// Response body for `GET /api/projects` — a flat array of metadata
@@ -87,7 +105,7 @@ async fn create_project(
     body: Result<Json<CreateProjectBody>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Project>), ApiError> {
     let Json(body) = body?;
-    let project = state.store.create(body.slug, body.name).await?;
+    let project = state.store.create(body.slug, body.name, body.template).await?;
     Ok((StatusCode::CREATED, Json(project)))
 }
 
@@ -197,12 +215,39 @@ async fn regen_project(
     Path(slug): Path<String>,
 ) -> Result<Json<GenerateReport>, ApiError> {
     let slug = parse_slug(&slug)?;
-    let graph = state.store.load_graph(&slug).await?;
+    let project = state.store.load(&slug).await?;
+
+    // T4: load every package's graph so the codegen tree walker can
+    // emit nested module files. Missing per-package graph files are
+    // tolerated — `generate_project_tree` falls back to an empty
+    // graph, which produces a stub `mod.rs` for that package.
+    let mut graphs: std::collections::HashMap<PackageSlug, Graph> =
+        std::collections::HashMap::with_capacity(project.packages.len());
+    for pkg in &project.packages {
+        match state.store.load_graph_for_package(&slug, &pkg.slug).await {
+            Ok(g) => {
+                graphs.insert(pkg.slug.clone(), g);
+            }
+            // Missing graph file is the expected state for a freshly
+            // created child package that has never had a PUT. The
+            // store's `read_json` helper maps `ENOENT` to
+            // `ApiError::NotFound`, so that's what we catch here —
+            // `Io(NotFound)` is never produced by this path.
+            Err(ApiError::NotFound) => {
+                // generate_project_tree falls back to an empty graph
+                // for missing entries and writes a stub mod.rs.
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
     let generator = Generator::new(
         Arc::clone(&state.registry),
         state.store.root().to_path_buf(),
     );
-    let report = generator.generate_project(&slug, &graph).await?;
+    let report = generator
+        .generate_project_tree(&slug, &project, &graphs)
+        .await?;
     Ok(Json(report))
 }
 
@@ -396,10 +441,447 @@ async fn run_status(
     Ok(Json(state.run_manager.status(slug.as_str())))
 }
 
+#[derive(Debug, Deserialize)]
+struct MarketplaceActionBody {
+    package: String,
+}
+
+/// `GET /api/projects/:slug/marketplace` — fetch the list of installed marketplace packages.
+async fn get_marketplace(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+) -> Result<Json<Vec<String>>, ApiError> {
+    let slug = parse_slug(&slug)?;
+    let packages = state.store.load_marketplace(&slug).await?;
+    Ok(Json(packages))
+}
+
+/// `POST /api/projects/:slug/marketplace/install` — install a marketplace package.
+async fn install_marketplace_package(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+    body: Result<Json<MarketplaceActionBody>, JsonRejection>,
+) -> Result<Json<Vec<String>>, ApiError> {
+    let slug = parse_slug(&slug)?;
+    let Json(body) = body?;
+    
+    let mut packages = state.store.load_marketplace(&slug).await?;
+    if !packages.contains(&body.package) {
+        packages.push(body.package.clone());
+        state.store.save_marketplace(&slug, &packages).await?;
+    }
+    
+    Ok(Json(packages))
+}
+
+/// `POST /api/projects/:slug/marketplace/uninstall` — uninstall a marketplace package.
+async fn uninstall_marketplace_package(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+    body: Result<Json<MarketplaceActionBody>, JsonRejection>,
+) -> Result<Json<Vec<String>>, ApiError> {
+    let slug = parse_slug(&slug)?;
+    let Json(body) = body?;
+    
+    let mut packages = state.store.load_marketplace(&slug).await?;
+    if let Some(pos) = packages.iter().position(|x| *x == body.package) {
+        packages.remove(pos);
+        state.store.save_marketplace(&slug, &packages).await?;
+    }
+    
+    Ok(Json(packages))
+}
+
 /// Helper — `Path<String>` → `Slug`. Centralised so the `invalid_slug`
 /// mapping doesn't drift across handlers.
 fn parse_slug(raw: &str) -> Result<Slug, ApiError> {
     Slug::new(raw).map_err(|e| ApiError::InvalidSlug(e.to_string()))
+}
+
+/// Helper — `Path<String>` → `PackageSlug`. Reuses the same `invalid_slug`
+/// error code as project slugs since both share the validator.
+fn parse_pkg_slug(raw: &str) -> Result<PackageSlug, ApiError> {
+    PackageSlug::new(raw).map_err(|e| ApiError::InvalidSlug(e.to_string()))
+}
+
+// ----- Package CRUD (Section 1 T3) -----
+
+/// Response body for `GET /api/projects/:slug/packages`.
+#[derive(Debug, Serialize)]
+struct ListPackagesResponse {
+    packages: Vec<Package>,
+}
+
+/// Request body for `POST /api/projects/:slug/packages`.
+///
+/// The server assigns the `id` (UUID v4) so the client cannot supply an
+/// empty or duplicate id. `parent_id` defaults to the root package when
+/// omitted, matching the common case of "add a sibling at the top
+/// level".
+#[derive(Debug, Deserialize)]
+struct CreatePackageBody {
+    slug: PackageSlug,
+    /// Parent's `PackageId.0`. Defaults to the root package's id when
+    /// omitted.
+    #[serde(default)]
+    parent_id: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+}
+
+/// Request body for `PATCH /api/projects/:slug/packages/:pkg`. All fields
+/// optional; missing fields leave the existing value unchanged.
+#[derive(Debug, Deserialize)]
+struct PatchPackageBody {
+    /// New slug. Renames the on-disk folder atomically.
+    #[serde(default)]
+    slug: Option<PackageSlug>,
+    /// New label. `None` here means "leave unchanged"; the JSON literal
+    /// `null` is treated identically. To clear a label, send the empty
+    /// string and the handler will store it as `None`.
+    #[serde(default)]
+    label: Option<String>,
+}
+
+/// `GET /api/projects/:slug/packages` — list every package in the tree.
+async fn list_packages(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+) -> Result<Json<ListPackagesResponse>, ApiError> {
+    let slug = parse_slug(&slug)?;
+    let project = state.store.load(&slug).await?;
+    Ok(Json(ListPackagesResponse { packages: project.packages }))
+}
+
+/// `POST /api/projects/:slug/packages` — create a new package as a child
+/// of an existing parent. Returns 201 + the new `Package`.
+///
+/// Failure modes mapped to HTTP:
+/// - sibling slug collision → 409 `conflict`
+/// - parent id not found    → 404 `not_found`
+/// - malformed body or slug → 400 `invalid_body` (the typed `PackageSlug`
+///   field's deserialiser rejects bad slugs before the handler runs, and
+///   Axum's `JsonRejection` is mapped to `InvalidBody` — both surface
+///   under the same 400 envelope)
+async fn create_package(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+    body: Result<Json<CreatePackageBody>, JsonRejection>,
+) -> Result<(StatusCode, Json<Package>), ApiError> {
+    let slug = parse_slug(&slug)?;
+    let Json(body) = body?;
+
+    // Mint a fresh server-side id so the tree never carries
+    // client-controlled empty / duplicate ids. Addresses the T1 MINOR.
+    let new_id = PackageId(format!("pkg-{}", uuid::Uuid::new_v4()));
+    let new_id_for_search = new_id.clone();
+
+    let new_pkg = Package {
+        id: new_id,
+        slug: body.slug,
+        parent_id: None, // resolved below inside the mutator under the lock
+        label: body.label,
+    };
+    let new_pkg_for_mutator = new_pkg.clone();
+
+    let updated = state
+        .store
+        .mutate_project(&slug, move |project| {
+            let mut pkg = new_pkg_for_mutator;
+
+            // Resolve parent: explicit id, or the root package as default.
+            let parent_id = match body.parent_id {
+                Some(raw) => {
+                    let pid = PackageId(raw);
+                    if !project.packages.iter().any(|p| p.id == pid) {
+                        return Err(ApiError::NotFound);
+                    }
+                    Some(pid)
+                }
+                None => project
+                    .packages
+                    .iter()
+                    .find(|p| p.parent_id.is_none())
+                    .map(|p| p.id.clone()),
+            };
+            pkg.parent_id = parent_id.clone();
+
+            // Sibling-slug collision pre-check so we surface the precise
+            // conflict reason rather than the generic
+            // `DuplicateSiblingSlug` from the tree validator.
+            let parent_key = parent_id.as_ref().map(|p| p.0.as_str());
+            for existing in &project.packages {
+                let ek = existing.parent_id.as_ref().map(|p| p.0.as_str());
+                if ek == parent_key && existing.slug == pkg.slug {
+                    return Err(ApiError::Conflict(format!(
+                        "package slug {} already exists under this parent",
+                        pkg.slug.as_str()
+                    )));
+                }
+            }
+
+            project.packages.push(pkg);
+            Ok(())
+        })
+        .await?;
+
+    // Locate the freshly inserted package to return it. The mutator
+    // moved a value so we look it up by the id we minted above.
+    let created = updated
+        .packages
+        .into_iter()
+        .find(|p| p.id == new_id_for_search)
+        .ok_or_else(|| ApiError::Internal("created package missing from tree after mutate".into()))?;
+
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+/// `PATCH /api/projects/:slug/packages/:pkg` — rename / relabel.
+///
+/// Slug rename atomically moves the on-disk folder
+/// (`packages/<old>/` → `packages/<new>/`) under the per-slug lock so
+/// graph data is preserved.
+async fn rename_package(
+    State(state): State<AppState>,
+    Path((slug, pkg)): Path<(String, String)>,
+    body: Result<Json<PatchPackageBody>, JsonRejection>,
+) -> Result<Json<Package>, ApiError> {
+    let slug = parse_slug(&slug)?;
+    let pkg_slug = parse_pkg_slug(&pkg)?;
+    let Json(body) = body?;
+
+    // Clones keep the borrow checker happy: `pkg_slug` is consumed by the
+    // closure but needed later for the disk rename + return-value
+    // lookup; `body.slug` is consumed inside the closure but needed
+    // afterwards to decide whether to move the on-disk folder.
+    let pkg_slug_for_closure = pkg_slug.clone();
+    let new_slug_for_closure = body.slug.clone();
+    let label_for_closure = body.label;
+
+    let updated = state
+        .store
+        .mutate_project(&slug, move |project| {
+            // Locate target without holding a mutable borrow across the
+            // collision scan.
+            let (current_parent, current_slug) = {
+                let target = project
+                    .packages
+                    .iter()
+                    .find(|p| p.slug == pkg_slug_for_closure)
+                    .ok_or(ApiError::NotFound)?;
+                (target.parent_id.clone(), target.slug.clone())
+            };
+
+            // Apply slug rename if requested and actually different.
+            if let Some(new_slug) = new_slug_for_closure.clone() {
+                if new_slug != current_slug {
+                    let collision = project.packages.iter().any(|p| {
+                        p.parent_id == current_parent && p.slug == new_slug
+                    });
+                    if collision {
+                        return Err(ApiError::Conflict(format!(
+                            "package slug {} already exists under this parent",
+                            new_slug.as_str()
+                        )));
+                    }
+                    // The same lookup succeeded a few lines above under
+                    // the same exclusive borrow, so this branch is
+                    // logically unreachable — but no-expect rule
+                    // applies on the request path, so map to Internal
+                    // explicitly rather than panic.
+                    let target = project
+                        .packages
+                        .iter_mut()
+                        .find(|p| p.slug == pkg_slug_for_closure)
+                        .ok_or_else(|| {
+                            ApiError::Internal(
+                                "package vanished between collision check and update"
+                                    .into(),
+                            )
+                        })?;
+                    target.slug = new_slug;
+                }
+            }
+
+            // Apply label change. After a slug rename above, locate the
+            // package by its (possibly new) slug.
+            if let Some(label) = label_for_closure {
+                let lookup = new_slug_for_closure
+                    .as_ref()
+                    .unwrap_or(&pkg_slug_for_closure)
+                    .clone();
+                let target = project
+                    .packages
+                    .iter_mut()
+                    .find(|p| p.slug == lookup)
+                    .ok_or(ApiError::NotFound)?;
+                target.label = if label.is_empty() { None } else { Some(label) };
+            }
+            Ok(())
+        })
+        .await?;
+
+    let new_slug_opt = body.slug;
+
+    // Move the on-disk folder if the slug actually changed. Done after
+    // the tree update so a disk-move failure leaves the tree in a
+    // consistent state (we then attempt to roll the tree back).
+    if let Some(ref ns) = new_slug_opt {
+        if ns != &pkg_slug {
+            if let Err(err) = state.store.rename_package_dir(&slug, &pkg_slug, ns).await {
+                // Best-effort rollback: revert the slug in the tree so
+                // disk and tree remain in agreement. If the rollback
+                // itself fails, surface the original error — the
+                // operator can reconcile manually from `.history/`.
+                let pkg_slug_for_rollback = pkg_slug.clone();
+                let ns_clone = ns.clone();
+                let _ = state
+                    .store
+                    .mutate_project(&slug, |project| {
+                        if let Some(t) = project.packages.iter_mut().find(|p| p.slug == ns_clone) {
+                            t.slug = pkg_slug_for_rollback;
+                        }
+                        Ok(())
+                    })
+                    .await;
+                return Err(err);
+            }
+        }
+    }
+
+    // Return the package by its post-rename slug (or unchanged).
+    let lookup_slug = new_slug_opt.as_ref().unwrap_or(&pkg_slug);
+    updated
+        .packages
+        .into_iter()
+        .find(|p| &p.slug == lookup_slug)
+        .map(Json)
+        .ok_or(ApiError::NotFound)
+}
+
+/// `DELETE /api/projects/:slug/packages/:pkg` — delete a package and all
+/// its descendants. 204 on success.
+///
+/// Cannot delete the root package (would leave the project with no
+/// entry point); attempts return 409 `conflict`.
+async fn delete_package(
+    State(state): State<AppState>,
+    Path((slug, pkg)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let slug = parse_slug(&slug)?;
+    let pkg_slug = parse_pkg_slug(&pkg)?;
+
+    // Capture every descendant's slug so we can clean their disk
+    // folders after the tree mutation. The mutator drains them from the
+    // tree into the shared Mutex; we drain them from disk after. The
+    // Mutex is needed because the closure is `FnOnce` and so cannot
+    // borrow a stack-local `&mut Vec` across the await boundary.
+    let to_remove_ref = std::sync::Arc::new(std::sync::Mutex::new(Vec::<PackageSlug>::new()));
+    let to_remove_writer = to_remove_ref.clone();
+
+    state
+        .store
+        .mutate_project(&slug, move |project| {
+            let target = project
+                .packages
+                .iter()
+                .find(|p| p.slug == pkg_slug)
+                .ok_or(ApiError::NotFound)?;
+            if target.parent_id.is_none() {
+                return Err(ApiError::Conflict(
+                    "cannot delete the root package of a project".into(),
+                ));
+            }
+            let target_id = target.id.clone();
+
+            // Compute the descendant set via BFS so a deep subtree
+            // (`a → b → c → d`) is removed in one shot.
+            let mut doomed_ids: Vec<PackageId> = vec![target_id];
+            let mut i = 0;
+            while i < doomed_ids.len() {
+                let parent = doomed_ids[i].clone();
+                for p in &project.packages {
+                    if p.parent_id.as_ref() == Some(&parent)
+                        && !doomed_ids.iter().any(|d| d == &p.id)
+                    {
+                        doomed_ids.push(p.id.clone());
+                    }
+                }
+                i += 1;
+            }
+
+            // Collect slugs for the disk-cleanup pass before mutating
+            // the vec.
+            let mut slugs: Vec<PackageSlug> = Vec::with_capacity(doomed_ids.len());
+            for id in &doomed_ids {
+                if let Some(p) = project.packages.iter().find(|p| &p.id == id) {
+                    slugs.push(p.slug.clone());
+                }
+            }
+            // Surface slugs to the outer scope without violating the
+            // closure's `FnOnce` contract.
+            if let Ok(mut w) = to_remove_writer.lock() {
+                w.extend(slugs);
+            }
+
+            project.packages.retain(|p| !doomed_ids.contains(&p.id));
+            Ok(())
+        })
+        .await?;
+
+    // Surface the descendant slugs from the closure-owned Mutex back
+    // into a plain Vec for the disk-cleanup loop.
+    let to_remove: Vec<PackageSlug> = to_remove_ref
+        .lock()
+        .map(|w| w.iter().cloned().collect())
+        .unwrap_or_default();
+
+    // Disk cleanup: best-effort. A failure here leaves the tree without
+    // the package (already persisted) but with the folder still present
+    // — recoverable. Errors are logged but not propagated, mirroring
+    // the existing post-save metadata-bump pattern in `save_graph`.
+    for s in to_remove {
+        if let Err(err) = state.store.delete_package_dir(&slug, &s).await {
+            tracing::warn!(
+                slug = %slug,
+                pkg = %s,
+                ?err,
+                "package folder cleanup failed; tree is updated but disk folder remains"
+            );
+        }
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /api/projects/:slug/packages/:pkg/graph` — load a single
+/// package's flow graph.
+async fn get_package_graph(
+    State(state): State<AppState>,
+    Path((slug, pkg)): Path<(String, String)>,
+) -> Result<Json<Graph>, ApiError> {
+    let slug = parse_slug(&slug)?;
+    let pkg_slug = parse_pkg_slug(&pkg)?;
+    let graph = state.store.load_graph_for_package(&slug, &pkg_slug).await?;
+    Ok(Json(graph))
+}
+
+/// `PUT /api/projects/:slug/packages/:pkg/graph` — replace a single
+/// package's flow graph atomically. Same validation pipeline as the
+/// top-level `PUT /graph` shim.
+async fn put_package_graph(
+    State(state): State<AppState>,
+    Path((slug, pkg)): Path<(String, String)>,
+    graph: Result<Json<Graph>, JsonRejection>,
+) -> Result<Json<Graph>, ApiError> {
+    let slug = parse_slug(&slug)?;
+    let pkg_slug = parse_pkg_slug(&pkg)?;
+    let Json(graph) = graph?;
+    state
+        .store
+        .save_graph_for_package(&slug, &pkg_slug, &graph, &state.registry)
+        .await?;
+    Ok(Json(graph))
 }
 
 #[derive(Debug, Deserialize)]
@@ -431,14 +913,18 @@ async fn generate_flow(
     let Json(body) = body?;
 
     let provider = body.provider.unwrap_or_else(|| {
-        if std::env::var("OPENAI_API_KEY").is_ok() {
+        if std::env::var("RUST_NO_CODE_TEST").is_ok() {
+            llm::LlmProvider::Anthropic
+        } else if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+            llm::LlmProvider::Anthropic
+        } else if std::env::var("OPENAI_API_KEY").is_ok() {
             llm::LlmProvider::OpenAi
         } else if std::env::var("DEEPSEEK_API_KEY").is_ok() {
             llm::LlmProvider::DeepSeek
         } else if std::env::var("KIMI_API_KEY").is_ok() {
             llm::LlmProvider::Kimi
         } else {
-            llm::LlmProvider::Anthropic
+            llm::LlmProvider::ClaudeCli
         }
     });
 
@@ -513,14 +999,18 @@ async fn refine_flow(
     let Json(body) = body?;
 
     let provider = body.provider.unwrap_or_else(|| {
-        if std::env::var("OPENAI_API_KEY").is_ok() {
+        if std::env::var("RUST_NO_CODE_TEST").is_ok() {
+            llm::LlmProvider::Anthropic
+        } else if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+            llm::LlmProvider::Anthropic
+        } else if std::env::var("OPENAI_API_KEY").is_ok() {
             llm::LlmProvider::OpenAi
         } else if std::env::var("DEEPSEEK_API_KEY").is_ok() {
             llm::LlmProvider::DeepSeek
         } else if std::env::var("KIMI_API_KEY").is_ok() {
             llm::LlmProvider::Kimi
         } else {
-            llm::LlmProvider::Anthropic
+            llm::LlmProvider::ClaudeCli
         }
     });
 

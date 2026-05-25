@@ -8,7 +8,13 @@ type PaletteState =
 
 /// Side panel listing every registered node template grouped by category.
 /// Items are draggable onto the ReactFlow canvas (S8).
-export default function NodePalette(): JSX.Element {
+interface NodePaletteProps {
+  installedMarketplace?: string[];
+}
+
+/// Side panel listing every registered node template grouped by category.
+/// Items are draggable onto the ReactFlow canvas (S8).
+export default function NodePalette({ installedMarketplace = [] }: NodePaletteProps): JSX.Element {
   const [state, setState] = useState<PaletteState>({ kind: "loading" });
 
   useEffect(() => {
@@ -44,7 +50,7 @@ export default function NodePalette(): JSX.Element {
   }
 
   return (
-    <aside className="node-palette">
+    <aside className="node-palette" style={{ borderRight: "none" }}>
       <h2>Nodes</h2>
       {state.kind === "loading" && <p className="muted">loading…</p>}
       {state.kind === "error" && (
@@ -58,18 +64,33 @@ export default function NodePalette(): JSX.Element {
           <section key={category} className="palette-group">
             <h3>{category}</h3>
             <ul>
-              {items.map((t) => (
-                <li
-                  key={t.id}
-                  className="palette-item"
-                  title={t.display.description}
-                  draggable
-                  onDragStart={(e) => onDragStart(e, t)}
-                >
-                  <span className="palette-item-name">{t.display.name}</span>
-                  <code className="palette-item-id">{t.id}</code>
-                </li>
-              ))}
+              {items.map((t) => {
+                const isMarketplace = t.display.category === "Marketplace";
+                const pkgName = t.id.replace("marketplace.", "");
+                const isLocked = isMarketplace && !installedMarketplace.includes(pkgName);
+
+                return (
+                  <li
+                    key={t.id}
+                    className={`palette-item ${isLocked ? "locked" : ""}`}
+                    title={isLocked ? `Locked — Install ${t.display.name} from the Marketplace tab to unlock this node.` : t.display.description}
+                    draggable={!isLocked}
+                    onDragStart={(e) => {
+                      if (isLocked) {
+                        e.preventDefault();
+                        return;
+                      }
+                      onDragStart(e, t);
+                    }}
+                    style={isLocked ? { opacity: 0.45, cursor: "not-allowed", borderStyle: "dashed" } : {}}
+                  >
+                    <span className="palette-item-name">
+                      {isLocked ? "🔒 " : ""}{t.display.name}
+                    </span>
+                    <code className="palette-item-id">{t.id}</code>
+                  </li>
+                );
+              })}
             </ul>
           </section>
         ))}

@@ -1,5 +1,5 @@
 import React from "react";
-import { SecurityAuditReport, VulnerabilityReport, SecretLeak, SecureCodeViolation } from "../api";
+import { SecurityAuditReport } from "../api";
 
 interface SecurityDrawerProps {
   isOpen: boolean;

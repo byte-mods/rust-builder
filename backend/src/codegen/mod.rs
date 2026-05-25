@@ -60,7 +60,7 @@ use thiserror::Error;
 
 use crate::error::ApiError;
 use crate::projects::types::Graph;
-use crate::projects::Slug;
+use crate::projects::{PackageSlug, Slug};
 use crate::templates::TemplateRegistry;
 
 /// Small deserialisable view of `http.route` config — used by the
@@ -162,10 +162,42 @@ impl Generator {
     /// Generate (or regenerate) the user-project for `slug` from the given
     /// `graph`. Orchestrates bootstrap files, per-node template emissions,
     /// region merging, and Cargo.toml rendering.
+    ///
+    /// Backwards-compatible shim — assumes a single-package project. New
+    /// callers should prefer [`Generator::generate_project_tree`] which
+    /// walks the full package tree and produces nested `mod.rs` files.
     pub async fn generate_project(
         &self,
         slug: &Slug,
         graph: &Graph,
+    ) -> Result<GenerateReport, CodegenError> {
+        self.generate_project_with_children(slug, graph, &[]).await
+    }
+
+    /// Same as [`Generator::generate_project`] but also splices a
+    /// `pub mod <child>;` line into the root `lib.rs`'s
+    /// `@generated:begin module_decls` region for every package slug in
+    /// `child_module_decls`. The new top-level
+    /// [`Generator::generate_project_tree`] uses this to declare each
+    /// immediate child of the root package after writing the child's
+    /// own `src/<slug>/mod.rs`.
+    pub async fn generate_project_with_children(
+        &self,
+        slug: &Slug,
+        graph: &Graph,
+        child_module_decls: &[String],
+    ) -> Result<GenerateReport, CodegenError> {
+        self.generate_project_inner(slug, graph, child_module_decls).await
+    }
+
+    /// Internal alias to keep the original `generate_project` body
+    /// identifier unchanged below — every existing reference still
+    /// works without textual edits at every call site.
+    async fn generate_project_inner(
+        &self,
+        slug: &Slug,
+        graph: &Graph,
+        child_module_decls: &[String],
     ) -> Result<GenerateReport, CodegenError> {
         let project_dir = self.project_dir(slug);
         let src_dir = project_dir.join("src");
@@ -182,9 +214,35 @@ impl Generator {
         // Collect spawn expressions for long-running tasks.
         let mut spawn_tasks: Vec<(String, String)> = Vec::new();
 
+        // Locate Entry Point Node and extract framework selection
+        let entry_point_node = graph.nodes.iter()
+            .find(|n| n.template_id.as_str() == "core.entry_point");
+
+        let has_routes = graph.nodes.iter().any(|n| n.template_id.as_str() == "http.route");
+
+        let framework = if !has_routes {
+            "none".to_string()
+        } else {
+            entry_point_node
+                .and_then(|n| n.config.get("framework").and_then(|v| v.as_str()))
+                .unwrap_or("axum")
+                .to_string()
+        };
+
+        let workers = entry_point_node
+            .and_then(|n| n.config.get("workers").and_then(|v| v.as_u64()))
+            .map(|w| w as usize);
+
+        let max_connections = entry_point_node
+            .and_then(|n| n.config.get("max_connections").and_then(|v| v.as_u64()))
+            .map(|c| c as usize);
+
+        let keep_alive_seconds = entry_point_node
+            .and_then(|n| n.config.get("keep_alive_seconds").and_then(|v| v.as_u64()));
+
         // --- 0. Bootstrap errors.rs (S7) ------------------------------------------
         let errors_src = format::validate_and_format(
-            &bootstrap::errors_rs(),
+            &bootstrap::errors_rs(&framework),
             "bootstrap",
             "errors",
         )?;
@@ -332,7 +390,14 @@ impl Generator {
         }
 
         // --- 2. main.rs (fully regenerated each pass) -----------------------------
-        let main_src = bootstrap::main_rs(slug, &spawn_tasks);
+        let main_src = bootstrap::main_rs(
+            slug,
+            &spawn_tasks,
+            &framework,
+            workers,
+            max_connections,
+            keep_alive_seconds,
+        );
         let main_path = src_dir.join("main.rs");
         if files::write_atomic_if_changed(&main_path, &main_src).await? {
             report.files_written.push("src/main.rs".to_string());
@@ -342,7 +407,7 @@ impl Generator {
         let lib_base = if src_dir.join("lib.rs").exists() {
             tokio::fs::read_to_string(src_dir.join("lib.rs")).await?
         } else {
-            bootstrap::lib_rs(slug)
+            bootstrap::lib_rs(slug, &framework)
         };
 
         let mut lib_regions = std::collections::HashMap::new();
@@ -352,6 +417,23 @@ impl Generator {
         module_decls.push_str("pub mod debug;\n");
         for dir in dir_mods.keys() {
             module_decls.push_str(&format!("pub mod {};\n", dir));
+        }
+        // T4: declare child packages of the root. The new
+        // generate_project_tree caller passes one entry per immediate
+        // child; each entry corresponds to a `src/<slug>/mod.rs` file
+        // written separately. Sorted for byte-stable output.
+        let mut sorted_children: Vec<&String> = child_module_decls.iter().collect();
+        sorted_children.sort();
+        for child in sorted_children {
+            // Guard against a child slug that would collide with a
+            // pre-existing top-level module dir (e.g. a user creates a
+            // package literally named `handlers`). Skip the duplicate
+            // declaration — codegen still writes the child folder, but
+            // we don't shadow the existing module entry. T6 covers the
+            // collision case in tests.
+            if !dir_mods.contains_key(child) && child != "errors" && child != "debug" {
+                module_decls.push_str(&format!("pub mod {};\n", child));
+            }
         }
         lib_regions.insert("module_decls".to_string(), module_decls);
 
@@ -367,31 +449,74 @@ impl Generator {
                     error: e.to_string(),
                 })?;
 
-            // Find the handler connected to this route's output port.
-            let handler_id = graph.edges.iter()
-                .find(|e| e.source == node.id)
+            // Find downstream handler and middlewares connected to this route
+            let mut middleware_names = Vec::new();
+            let mut terminal_handler_node = None;
+
+            let mut current_target_id = graph.edges.iter()
+                .find(|e| e.source == node.id && e.source_port == "request")
                 .map(|e| &e.target);
 
-            if let Some(handler_id) = handler_id {
-                if let Some(handler_node) = graph.nodes.iter().find(|n| &n.id == handler_id) {
-                    let handler_cfg: HandlerConfig = serde_json::from_value(handler_node.config.clone())
-                        .map_err(|e| CodegenError::InvalidEmission {
-                            template_id: "http.handler".to_string(),
-                            node_id: handler_node.id.0.clone(),
-                            error: e.to_string(),
-                        })?;
+            while let Some(target_id) = current_target_id {
+                if let Some(next_node) = graph.nodes.iter().find(|n| &n.id == target_id) {
+                    match next_node.template_id.as_str() {
+                        "http.middleware" => {
+                            if let Some(name) = next_node.config.get("name").and_then(|v| v.as_str()) {
+                                middleware_names.push(name.to_string());
+                            }
+                            current_target_id = graph.edges.iter()
+                                .find(|e| e.source == next_node.id && e.source_port == "handler")
+                                .map(|e| &e.target);
+                        }
+                        "http.handler" => {
+                            terminal_handler_node = Some(next_node);
+                            break;
+                        }
+                        _ => break,
+                    }
+                } else {
+                    break;
+                }
+            }
 
-                    let method_fn = match route_cfg.method.as_str() {
-                        "GET" => "get",
-                        "POST" => "post",
-                        "PUT" => "put",
-                        "DELETE" => "delete",
-                        _ => "get",
-                    };
+            if let Some(handler_node) = terminal_handler_node {
+                let handler_cfg: HandlerConfig = serde_json::from_value(handler_node.config.clone())
+                    .map_err(|e| CodegenError::InvalidEmission {
+                        template_id: "http.handler".to_string(),
+                        node_id: handler_node.id.0.clone(),
+                        error: e.to_string(),
+                    })?;
+
+                let method_upper = route_cfg.method.to_uppercase();
+                let method_fn = method_upper.to_lowercase();
+
+                if framework == "actix" {
+                    // Actix Web Route mounting with sequential wrap middlewares
+                    let mut wrap_block = String::new();
+                    for mw_name in &middleware_names {
+                        wrap_block.push_str(&format!(
+                            "\n            .wrap(actix_web_lab::middleware::from_fn(middlewares::{}::{}))",
+                            mw_name, mw_name
+                        ));
+                    }
 
                     routes.push_str(&format!(
-                        "    r = r.route(\"{}\", axum::routing::{}(handlers::{}::{}));\n",
-                        route_cfg.path, method_fn, handler_cfg.name, handler_cfg.name
+                        "    cfg.service(\n        actix_web::web::resource(\"{}\"){}\n            .route(actix_web::web::{}().to(handlers::{}::{}))\n    );\n",
+                        route_cfg.path, wrap_block, method_fn, handler_cfg.name, handler_cfg.name
+                    ));
+                } else {
+                    // Axum Route mounting with sequential layer middlewares
+                    let mut layer_block = String::new();
+                    for mw_name in &middleware_names {
+                        layer_block.push_str(&format!(
+                            ".layer(axum::middleware::from_fn(middlewares::{}::{}))",
+                            mw_name, mw_name
+                        ));
+                    }
+
+                    routes.push_str(&format!(
+                        "    r = r.route(\"{}\", axum::routing::{}(handlers::{}::{}){});\n",
+                        route_cfg.path, method_fn, handler_cfg.name, handler_cfg.name, layer_block
                     ));
                 }
             }
@@ -437,10 +562,38 @@ impl Generator {
             }
         }
 
+        // Load marketplace packages and inject them as dependencies
+        let marketplace_path = project_dir.join("marketplace.json");
+        if marketplace_path.exists() {
+            if let Ok(content) = tokio::fs::read_to_string(&marketplace_path).await {
+                if let Ok(packages) = serde_json::from_str::<Vec<String>>(&content) {
+                    for pkg in packages {
+                        match pkg.as_str() {
+                            "scylla" => all_deps.push(("scylla".to_string(), "0.10.0".to_string())),
+                            "mongodb" => all_deps.push(("mongodb".to_string(), "2.8.0".to_string())),
+                            "nats" => all_deps.push(("async-nats".to_string(), "0.33.0".to_string())),
+                            "surrealdb" => all_deps.push(("surrealdb".to_string(), "{ version = \"1.0\", features = [\"kv-mem\"] }".to_string())),
+                            "clickhouse" => all_deps.push(("clickhouse".to_string(), "{ version = \"0.11\", features = [\"lz4\"] }".to_string())),
+                            "s3" => all_deps.push(("aws-sdk-s3".to_string(), "1.0.0".to_string())),
+                            "webrtc" => all_deps.push(("webrtc".to_string(), "0.10.0".to_string())),
+                            "rabbitmq" => all_deps.push(("lapin".to_string(), "0.15.0".to_string())),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        // Inject actix-web dependencies if actix is chosen
+        if framework == "actix" {
+            all_deps.push(("actix-web".to_string(), "4".to_string()));
+            all_deps.push(("actix-web-lab".to_string(), "0.20".to_string()));
+        }
+
         // --- 5. Cargo.toml --------------------------------------------------------
         all_deps.sort_by(|a, b| a.0.cmp(&b.0));
         all_deps.dedup_by(|a, b| a.0 == b.0);
-        let cargo_src = cargo_toml::render(slug, &all_deps);
+        let cargo_src = cargo_toml::render(slug, &all_deps, &framework);
         let cargo_path = project_dir.join("Cargo.toml");
         if files::write_atomic_if_changed(&cargo_path, &cargo_src).await? {
             report.files_written.push("Cargo.toml".to_string());
@@ -460,6 +613,223 @@ impl Generator {
         report.pending_templates.dedup();
 
         Ok(report)
+    }
+
+    /// Generate the full source tree for a multi-package project.
+    ///
+    /// Walks the package tree in `project` and writes:
+    /// - root package code (via the existing single-package pipeline)
+    /// - one `src/<absolute-path>/mod.rs` per non-root package
+    /// - `pub mod <child>;` declarations spliced into each parent's
+    ///   `mod.rs` (or the root's `lib.rs`) inside the existing
+    ///   `@generated:begin module_decls` region
+    ///
+    /// `graphs` maps each [`PackageSlug`] to the graph fragment to emit
+    /// for that package. The root package's graph is required;
+    /// non-root entries are optional — a missing entry produces an
+    /// empty stub `mod.rs` so the parent's `pub mod` declaration still
+    /// resolves.
+    ///
+    /// **Scope note (T4):** non-root packages currently receive a stub
+    /// `mod.rs` plus any nested `pub mod` declarations. Running the
+    /// full per-node emission pipeline inside a child package requires
+    /// plumbing a package path prefix through `CodegenCtx` and every
+    /// template's output path computation — a separate (cross-cutting)
+    /// task. The structural mechanism (nested module tree, parent
+    /// declarations, file layout) lands here so the multi-package
+    /// model is reachable from `cargo check` end-to-end.
+    pub async fn generate_project_tree(
+        &self,
+        slug: &Slug,
+        project: &crate::projects::types::Project,
+        graphs: &std::collections::HashMap<PackageSlug, Graph>,
+    ) -> Result<GenerateReport, CodegenError> {
+        // Locate the root.
+        let root = project
+            .packages
+            .iter()
+            .find(|p| p.parent_id.is_none())
+            .ok_or_else(|| CodegenError::InvalidEmission {
+                template_id: "<package-tree>".into(),
+                node_id: "<root>".into(),
+                error: "project has no root package".into(),
+            })?;
+
+        // Group packages by parent_id for fast child lookup.
+        let mut children_by_parent: std::collections::HashMap<
+            Option<&crate::projects::types::PackageId>,
+            Vec<&crate::projects::types::Package>,
+        > = std::collections::HashMap::new();
+        for p in &project.packages {
+            children_by_parent.entry(p.parent_id.as_ref()).or_default().push(p);
+        }
+
+        // Direct children of root → their slugs become `pub mod <slug>;`
+        // declarations in root `lib.rs`.
+        let root_children: Vec<String> = children_by_parent
+            .get(&Some(&root.id))
+            .map(|v| v.iter().map(|p| p.slug.as_str().to_string()).collect())
+            .unwrap_or_default();
+
+        // Emit root code with the child-declarations included.
+        let empty_graph = Graph::default();
+        let root_graph = graphs.get(&root.slug).unwrap_or(&empty_graph);
+        let mut report = self
+            .generate_project_with_children(slug, root_graph, &root_children)
+            .await?;
+
+        // Walk non-root packages depth-first and write each `mod.rs`.
+        // Path resolution: for a package, walk up `parent_id` chain to
+        // the root, collecting slugs in reverse. The root contributes
+        // nothing (it's `src/` itself).
+        let project_dir = self.project_dir(slug);
+        let src_dir = project_dir.join("src");
+        for pkg in &project.packages {
+            if pkg.parent_id.is_none() {
+                continue; // root handled above
+            }
+            let rel_path = match self.package_relative_path(project, pkg) {
+                Some(p) => p,
+                None => continue, // malformed tree (validator would have caught earlier)
+            };
+
+            let pkg_dir = src_dir.join(&rel_path);
+            tokio::fs::create_dir_all(&pkg_dir).await?;
+
+            // Build the mod.rs content: a stub header + a
+            // `@generated:begin module_decls` region listing this
+            // package's immediate children (if any).
+            let mut child_decls = String::new();
+            if let Some(cs) = children_by_parent.get(&Some(&pkg.id)) {
+                let mut ss: Vec<&str> = cs.iter().map(|c| c.slug.as_str()).collect();
+                ss.sort();
+                for s in ss {
+                    child_decls.push_str(&format!("pub mod {};\n", s));
+                }
+            }
+
+            let mod_path = pkg_dir.join("mod.rs");
+
+            // Slug-collision safe path: if `mod.rs` already exists at
+            // this location (which happens when a child package slug
+            // matches a directory already populated by per-node
+            // emissions — e.g. a package literally named `handlers`),
+            // splice our module_decls region into the existing file
+            // rather than overwriting it. The per-node emissions own
+            // the file body; T4 only contributes child declarations.
+            let existing = tokio::fs::read_to_string(&mod_path).await.ok();
+            let new_src = match existing {
+                Some(text) => {
+                    // If the existing file already carries a
+                    // `module_decls` region, splice our child decls
+                    // into it. Otherwise leave the file untouched —
+                    // a user-authored `mod.rs` without our region is
+                    // out of bounds for T4 to modify.
+                    if text.contains("// @generated:begin module_decls") {
+                        let mut regions = std::collections::HashMap::new();
+                        // Preserve any non-T4 entries the existing
+                        // region may have (e.g. per-node decls) by
+                        // parsing them out and appending our child
+                        // decls. Simplest implementation: read the
+                        // existing region body, strip any prior
+                        // `pub mod <our-children>;` lines, then
+                        // append the current set.
+                        let mut merged_body = String::new();
+                        let begin = "// @generated:begin module_decls";
+                        let end = "// @generated:end module_decls";
+                        if let (Some(b), Some(e)) = (text.find(begin), text.find(end)) {
+                            let body_start = b + begin.len();
+                            let existing_body = &text[body_start..e];
+                            // Keep every line that isn't one of our
+                            // about-to-be-injected child decls (to
+                            // avoid duplicates across regens).
+                            let our_decls: std::collections::HashSet<String> = child_decls
+                                .lines()
+                                .map(|l| l.trim().to_string())
+                                .filter(|l| !l.is_empty())
+                                .collect();
+                            for line in existing_body.lines() {
+                                let t = line.trim();
+                                if t.is_empty() || our_decls.contains(t) {
+                                    continue;
+                                }
+                                merged_body.push_str(line);
+                                merged_body.push('\n');
+                            }
+                        }
+                        merged_body.push_str(&child_decls);
+                        regions.insert("module_decls".to_string(), merged_body);
+                        match regions::merge(&text, &regions) {
+                            Ok(outcome) => outcome.text,
+                            // Region parse failure: leave file alone.
+                            // A user-edited file outside our control
+                            // is more valuable than a stub overwrite.
+                            Err(_) => text,
+                        }
+                    } else {
+                        // File exists but has no region marker — it
+                        // was authored elsewhere. Don't touch it.
+                        text
+                    }
+                }
+                None => format!(
+                    "//! Generated package module — `{}`.\n\
+                     //!\n\
+                     //! This file is regenerated each pass. Add user code in\n\
+                     //! sibling files within this folder; they will be\n\
+                     //! preserved across regenerations.\n\
+                     \n\
+                     #![allow(dead_code, unused_imports, unused_variables)]\n\
+                     \n\
+                     // @generated:begin module_decls\n\
+                     {}// @generated:end module_decls\n",
+                    pkg.slug.as_str(),
+                    child_decls,
+                ),
+            };
+
+            if files::write_atomic_if_changed(&mod_path, &new_src).await? {
+                let rel = format!("src/{}/mod.rs", rel_path.display());
+                report.files_written.push(rel);
+            }
+        }
+
+        Ok(report)
+    }
+
+    /// Compute the path of `pkg` relative to `src/`, joining slugs from
+    /// each ancestor up to (but not including) the root package.
+    /// Returns `None` if the tree is malformed (a parent_id reference
+    /// fails to resolve); the caller treats that as "skip this package".
+    fn package_relative_path(
+        &self,
+        project: &crate::projects::types::Project,
+        pkg: &crate::projects::types::Package,
+    ) -> Option<PathBuf> {
+        let mut chain: Vec<&str> = vec![pkg.slug.as_str()];
+        let mut cursor = pkg.parent_id.as_ref();
+        let mut depth = 0usize;
+        while let Some(pid) = cursor {
+            // Safety cap: a valid tree can't be deeper than the package
+            // count. The validator should have caught cycles earlier;
+            // this guards a regression.
+            if depth > project.packages.len() {
+                return None;
+            }
+            let parent = project.packages.iter().find(|p| &p.id == pid)?;
+            if parent.parent_id.is_none() {
+                break; // hit root; do not push its slug
+            }
+            chain.push(parent.slug.as_str());
+            cursor = parent.parent_id.as_ref();
+            depth += 1;
+        }
+        chain.reverse();
+        let mut path = PathBuf::new();
+        for seg in chain {
+            path.push(seg);
+        }
+        Some(path)
     }
 }
 
@@ -516,7 +886,7 @@ fn instrument_source(
                     }
                 } else {
                     ::syn::parse_quote! {
-                        crate::debug::bridge_after(#node_id_str, debug_res);
+                        crate::debug::bridge_after(#node_id_str, &result);
                     }
                 };
 
@@ -1133,5 +1503,297 @@ message Person {
                 file
             );
         }
+    }
+
+    // ----- T4: multi-package tree codegen -----
+
+    /// Build a minimal valid Project with the given package shape. Used
+    /// by T4 tests to stand up a fully-validated tree without running
+    /// the HTTP layer.
+    fn make_project_with_packages(
+        slug: &str,
+        packages: Vec<crate::projects::types::Package>,
+    ) -> crate::projects::types::Project {
+        use time::OffsetDateTime;
+        crate::projects::types::Project {
+            meta: crate::projects::types::ProjectMeta {
+                slug: Slug::new(slug).unwrap(),
+                name: slug.into(),
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                updated_at: OffsetDateTime::UNIX_EPOCH,
+                schema_version: crate::projects::types::PROJECT_SCHEMA_VERSION,
+            },
+            packages,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_project_tree_emits_root_child_and_pub_mod_decl() {
+        // The structural mechanism T4 establishes: a project with one
+        // child package produces `src/auth/mod.rs` AND the root
+        // `lib.rs` declares it via `pub mod auth;` inside the
+        // module_decls region.
+        use crate::projects::types::{Package, PackageId, PackageSlug};
+
+        let dir = tempdir().unwrap();
+        let registry = Arc::new(TemplateRegistry::with_builtins());
+        let gen = Generator::new(registry, dir.path().to_path_buf());
+        tokio::fs::create_dir(dir.path().join("multi-pkg")).await.unwrap();
+
+        let project = make_project_with_packages(
+            "multi-pkg",
+            vec![
+                Package {
+                    id: PackageId("root".into()),
+                    slug: PackageSlug::root(),
+                    parent_id: None,
+                    label: None,
+                },
+                Package {
+                    id: PackageId("auth".into()),
+                    slug: PackageSlug::new("auth").unwrap(),
+                    parent_id: Some(PackageId("root".into())),
+                    label: None,
+                },
+            ],
+        );
+        project.validate_package_tree().expect("fixture valid");
+
+        let graphs = std::collections::HashMap::new();
+        let report = gen
+            .generate_project_tree(
+                &Slug::new("multi-pkg").unwrap(),
+                &project,
+                &graphs,
+            )
+            .await
+            .unwrap();
+
+        // Child package's mod.rs exists.
+        let child_mod = dir.path().join("multi-pkg/src/auth/mod.rs");
+        assert!(child_mod.exists(), "child package mod.rs must be written");
+        let child_src = tokio::fs::read_to_string(&child_mod).await.unwrap();
+        assert!(
+            child_src.contains("// @generated:begin module_decls"),
+            "child mod.rs carries the region marker for future grandchildren"
+        );
+
+        // Root lib.rs declares the child.
+        let lib_src = tokio::fs::read_to_string(dir.path().join("multi-pkg/src/lib.rs"))
+            .await
+            .unwrap();
+        assert!(
+            lib_src.contains("pub mod auth;"),
+            "root lib.rs must declare `pub mod auth;`, got:\n{lib_src}"
+        );
+
+        // Report mentions the new file.
+        assert!(
+            report.files_written.iter().any(|f| f == "src/auth/mod.rs"),
+            "report must include the child mod.rs; got {:?}",
+            report.files_written
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_project_tree_nested_grandchild_path() {
+        // `root → auth → otp` must produce `src/auth/otp/mod.rs` and the
+        // intermediate `src/auth/mod.rs` must declare `pub mod otp;`.
+        use crate::projects::types::{Package, PackageId, PackageSlug};
+
+        let dir = tempdir().unwrap();
+        let registry = Arc::new(TemplateRegistry::with_builtins());
+        let gen = Generator::new(registry, dir.path().to_path_buf());
+        tokio::fs::create_dir(dir.path().join("nested-pkg")).await.unwrap();
+
+        let project = make_project_with_packages(
+            "nested-pkg",
+            vec![
+                Package {
+                    id: PackageId("root".into()),
+                    slug: PackageSlug::root(),
+                    parent_id: None,
+                    label: None,
+                },
+                Package {
+                    id: PackageId("auth".into()),
+                    slug: PackageSlug::new("auth").unwrap(),
+                    parent_id: Some(PackageId("root".into())),
+                    label: None,
+                },
+                Package {
+                    id: PackageId("otp".into()),
+                    slug: PackageSlug::new("otp").unwrap(),
+                    parent_id: Some(PackageId("auth".into())),
+                    label: None,
+                },
+            ],
+        );
+        project.validate_package_tree().unwrap();
+
+        let graphs = std::collections::HashMap::new();
+        gen.generate_project_tree(
+            &Slug::new("nested-pkg").unwrap(),
+            &project,
+            &graphs,
+        )
+        .await
+        .unwrap();
+
+        let grandchild = dir.path().join("nested-pkg/src/auth/otp/mod.rs");
+        assert!(grandchild.exists(), "nested grandchild mod.rs must be written");
+
+        let auth_mod = tokio::fs::read_to_string(dir.path().join("nested-pkg/src/auth/mod.rs"))
+            .await
+            .unwrap();
+        assert!(
+            auth_mod.contains("pub mod otp;"),
+            "intermediate mod.rs must declare its child"
+        );
+
+        // Root lib.rs declares `auth` but NOT `otp` (otp is two levels
+        // deep — it's reached via `auth::otp`).
+        let lib_src = tokio::fs::read_to_string(dir.path().join("nested-pkg/src/lib.rs"))
+            .await
+            .unwrap();
+        assert!(lib_src.contains("pub mod auth;"));
+        assert!(
+            !lib_src.contains("pub mod otp;"),
+            "root lib.rs must NOT declare grandchildren — they belong under their parent"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_project_tree_preserves_existing_mod_rs_on_slug_collision() {
+        // BLOCKER regression guard: if a child package slug matches a
+        // directory already populated by per-node emissions (e.g. a
+        // user creates a child literally named `handlers` alongside an
+        // `http.handler` node that produced `src/handlers/mod.rs`), the
+        // T4 child-loop must NOT overwrite the existing file. It splices
+        // its module_decls region into the existing content instead.
+        use crate::projects::types::{Package, PackageId, PackageSlug};
+
+        let dir = tempdir().unwrap();
+        let registry = Arc::new(TemplateRegistry::with_builtins());
+        let gen = Generator::new(registry, dir.path().to_path_buf());
+        let proj_root = dir.path().join("collide");
+        tokio::fs::create_dir(&proj_root).await.unwrap();
+
+        // Manually pre-stage what a per-node emission would produce —
+        // a `src/handlers/mod.rs` carrying the standard region with a
+        // `pub mod login;` declaration inside.
+        let src = proj_root.join("src");
+        tokio::fs::create_dir_all(src.join("handlers")).await.unwrap();
+        let pre_existing =
+            "// @generated:begin module_decls\npub mod login;\n// @generated:end module_decls\n";
+        tokio::fs::write(src.join("handlers/mod.rs"), pre_existing).await.unwrap();
+
+        // Project tree: root + child named `handlers` (the colliding name).
+        let project = make_project_with_packages(
+            "collide",
+            vec![
+                Package {
+                    id: PackageId("root".into()),
+                    slug: PackageSlug::root(),
+                    parent_id: None,
+                    label: None,
+                },
+                Package {
+                    id: PackageId("h".into()),
+                    slug: PackageSlug::new("handlers").unwrap(),
+                    parent_id: Some(PackageId("root".into())),
+                    label: None,
+                },
+            ],
+        );
+        project.validate_package_tree().unwrap();
+
+        let graphs = std::collections::HashMap::new();
+        gen.generate_project_tree(
+            &Slug::new("collide").unwrap(),
+            &project,
+            &graphs,
+        )
+        .await
+        .unwrap();
+
+        let after = tokio::fs::read_to_string(src.join("handlers/mod.rs"))
+            .await
+            .unwrap();
+        // The pre-existing `pub mod login;` must survive — losing it
+        // would break `cargo check` on the per-node-emitted handler.
+        assert!(
+            after.contains("pub mod login;"),
+            "collision must not destroy per-node emissions; got:\n{after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_project_tree_is_deterministic() {
+        // Same project tree → byte-identical output. Critical for the
+        // regen-skip cache (T2 store) to actually skip on no-op runs.
+        use crate::projects::types::{Package, PackageId, PackageSlug};
+
+        let dir = tempdir().unwrap();
+        let registry = Arc::new(TemplateRegistry::with_builtins());
+        let gen = Generator::new(registry, dir.path().to_path_buf());
+        tokio::fs::create_dir(dir.path().join("det")).await.unwrap();
+
+        let project = make_project_with_packages(
+            "det",
+            vec![
+                Package {
+                    id: PackageId("root".into()),
+                    slug: PackageSlug::root(),
+                    parent_id: None,
+                    label: None,
+                },
+                Package {
+                    id: PackageId("b".into()),
+                    slug: PackageSlug::new("billing").unwrap(),
+                    parent_id: Some(PackageId("root".into())),
+                    label: None,
+                },
+                Package {
+                    id: PackageId("a".into()),
+                    slug: PackageSlug::new("auth").unwrap(),
+                    parent_id: Some(PackageId("root".into())),
+                    label: None,
+                },
+            ],
+        );
+
+        let graphs = std::collections::HashMap::new();
+        gen.generate_project_tree(
+            &Slug::new("det").unwrap(),
+            &project,
+            &graphs,
+        )
+        .await
+        .unwrap();
+        let lib_first = tokio::fs::read_to_string(dir.path().join("det/src/lib.rs"))
+            .await
+            .unwrap();
+
+        gen.generate_project_tree(
+            &Slug::new("det").unwrap(),
+            &project,
+            &graphs,
+        )
+        .await
+        .unwrap();
+        let lib_second = tokio::fs::read_to_string(dir.path().join("det/src/lib.rs"))
+            .await
+            .unwrap();
+
+        assert_eq!(lib_first, lib_second);
+        // And the sibling ordering is alphabetical regardless of vec
+        // order — `auth` declared before `billing`.
+        let auth_pos = lib_first.find("pub mod auth;").expect("auth declared");
+        let bill_pos = lib_first.find("pub mod billing;").expect("billing declared");
+        assert!(
+            auth_pos < bill_pos,
+            "siblings must be declared in alphabetical order"
+        );
     }
 }

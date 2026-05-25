@@ -40,6 +40,7 @@ pub mod connectors;
 pub mod stream;
 pub mod wasm;
 pub mod grpc;
+pub mod marketplace;
 
 /// Register every built-in template into `registry`. Called once at startup
 /// from `TemplateRegistry::with_builtins`. Panics on duplicate id — that's
@@ -55,6 +56,7 @@ pub fn register_all(registry: &mut TemplateRegistry) {
     reg!(EntryPoint::new());
     reg!(HttpRoute::new());
     reg!(HttpHandler::new());
+    reg!(HttpMiddleware::new());
     reg!(CoreService::new());
     reg!(CoreDto::new());
     reg!(ObservabilityLogger::new());
@@ -120,6 +122,16 @@ pub fn register_all(registry: &mut TemplateRegistry) {
     // Milestone 4 — gRPC Server & Client
     reg!(grpc::GrpcServer::new());
     reg!(grpc::GrpcClient::new());
+
+    // S22 — Marketplace Enterprise Connectors
+    reg!(marketplace::ScyllaDb::new());
+    reg!(marketplace::MongoDb::new());
+    reg!(marketplace::Nats::new());
+    reg!(marketplace::SurrealDb::new());
+    reg!(marketplace::ClickHouse::new());
+    reg!(marketplace::AwsS3::new());
+    reg!(marketplace::WebRtc::new());
+    reg!(marketplace::RabbitMq::new());
 }
 
 // ---- shared construction helper -------------------------------------------
@@ -153,7 +165,7 @@ fn to_snake_case(s: &str) -> String {
 
 // ---- core.entry_point -----------------------------------------------------
 
-#[derive(Debug, JsonSchema, Deserialize)]
+#[derive(Debug, JsonSchema, Deserialize, Clone)]
 #[allow(dead_code)]
 struct EntryPointConfig {
     /// Bind address for the HTTP server. Defaults to 127.0.0.1:8080.
@@ -162,10 +174,20 @@ struct EntryPointConfig {
     /// Log level filter. Defaults to info.
     #[serde(default = "default_log_level")]
     log_level: String,
+    /// The HTTP server framework to use (axum or actix).
+    #[serde(default = "default_framework")]
+    framework: String,
+    /// The number of worker threads to spawn.
+    workers: Option<usize>,
+    /// The maximum number of concurrent connections to accept.
+    max_connections: Option<usize>,
+    /// The TCP keep-alive duration in seconds.
+    keep_alive_seconds: Option<u64>,
 }
 
 fn default_bind() -> String { "127.0.0.1:8080".into() }
 fn default_log_level() -> String { "info".into() }
+fn default_framework() -> String { "axum".into() }
 
 pub struct EntryPoint {
     id: TemplateId,
@@ -287,6 +309,95 @@ impl NodeTemplate for HttpRoute {
     }
 }
 
+// ---- http.middleware ------------------------------------------------------
+
+#[derive(Debug, JsonSchema, Deserialize)]
+#[allow(dead_code)]
+struct HttpMiddlewareConfig {
+    /// Snake_case Rust middleware function name, e.g. `logger_mw`.
+    name: String,
+    /// Monaco-editable Rust middleware body code.
+    body: String,
+}
+
+pub struct HttpMiddleware {
+    id: TemplateId,
+    display: TemplateDisplay,
+    inputs: Vec<PortSpec>,
+    outputs: Vec<PortSpec>,
+    schema: Value,
+}
+
+impl HttpMiddleware {
+    pub fn new() -> Self {
+        Self {
+            id: id_or_panic("http.middleware"),
+            display: TemplateDisplay::new(
+                "HTTP Middleware",
+                "HTTP",
+                "Applies a custom middleware block before or after handling routes (compatible with both Axum and Actix Web).",
+            ),
+            inputs: vec![PortSpec::single("request", "http.request", "Wire incoming request here.")],
+            outputs: vec![PortSpec::single("handler", "http.request", "Forward request to next middleware or handler.")],
+            schema: schema_value::<HttpMiddlewareConfig>(),
+        }
+    }
+}
+
+impl NodeTemplate for HttpMiddleware {
+    fn id(&self) -> &TemplateId { &self.id }
+    fn display(&self) -> &TemplateDisplay { &self.display }
+    fn input_ports(&self) -> &[PortSpec] { &self.inputs }
+    fn output_ports(&self) -> &[PortSpec] { &self.outputs }
+    fn config_schema(&self) -> &Value { &self.schema }
+
+    fn emit_runtime(
+        &self,
+        ctx: &crate::templates::codegen::CodegenCtx<'_>,
+    ) -> Result<crate::templates::codegen::RuntimeEmission, crate::templates::TemplateError> {
+        let config: HttpMiddlewareConfig = serde_json::from_value(ctx.node.config.clone())
+            .map_err(|e| crate::templates::TemplateError::ConfigMismatch(e.to_string()))?;
+
+        let entry_point_node = ctx.graph.nodes.iter()
+            .find(|n| n.template_id.as_str() == "core.entry_point");
+        let framework = entry_point_node
+            .and_then(|n| n.config.get("framework").and_then(|f| f.as_str()))
+            .unwrap_or("axum");
+
+        let source = if framework == "actix" {
+            format!(
+                r#"use actix_web::{{dev::{{ServiceRequest, ServiceResponse}}, Error}};
+use actix_web_lab::middleware::Next;
+
+pub async fn {}(req: ServiceRequest, next: Next<impl actix_web::body::MessageBody + 'static>) -> Result<ServiceResponse, Error> {{
+{}
+}}
+"#,
+                config.name, config.body
+            )
+        } else {
+            format!(
+                r#"use axum::{{body::Body, http::Request, middleware::Next, response::Response}};
+
+pub async fn {}(req: Request<Body>, next: Next) -> Result<Response, Response> {{
+{}
+}}
+"#,
+                config.name, config.body
+            )
+        };
+
+        Ok(crate::templates::codegen::RuntimeEmission {
+            items: vec![crate::templates::codegen::EmittedItem {
+                module_path: format!("middlewares/{}.rs", config.name),
+                source,
+            }],
+            dependencies: vec![],
+            debug_site: None,
+        })
+    }
+}
+
 // ---- http.handler ---------------------------------------------------------
 
 #[derive(Debug, JsonSchema, Deserialize)]
@@ -294,6 +405,8 @@ impl NodeTemplate for HttpRoute {
 struct HttpHandlerConfig {
     /// Snake_case Rust function name for the generated handler, e.g. `hello`.
     name: String,
+    /// Optional custom Rust source code. If present, emitted verbatim.
+    code: Option<String>,
 }
 
 pub struct HttpHandler {
@@ -334,6 +447,25 @@ impl NodeTemplate for HttpHandler {
         let config: HttpHandlerConfig = serde_json::from_value(ctx.node.config.clone())
             .map_err(|e| crate::templates::TemplateError::ConfigMismatch(e.to_string()))?;
 
+        if let Some(ref custom_code) = config.code {
+            // Emitted verbatim! This allows absolute custom control over imports, helper methods,
+            // extraction, and business logic.
+            return Ok(crate::templates::codegen::RuntimeEmission {
+                items: vec![crate::templates::codegen::EmittedItem {
+                    module_path: format!("handlers/{}.rs", config.name),
+                    source: custom_code.clone(),
+                }],
+                dependencies: vec![
+                    ("once_cell".to_string(), "1.18".to_string()),
+                    ("futures".to_string(), "0.3".to_string()),
+                    ("actix-multipart".to_string(), "0.6".to_string()),
+                    ("bcrypt".to_string(), "0.15".to_string()),
+                    ("jsonwebtoken".to_string(), "9.2".to_string()),
+                ],
+                debug_site: None,
+            });
+        }
+
         let mut uses = String::new();
         let mut body = String::new();
 
@@ -349,16 +481,36 @@ impl NodeTemplate for HttpHandler {
             }
         }
 
-        let source = if uses.is_empty() {
-            format!(
-                "use axum::response::IntoResponse;\nuse crate::errors::AppError;\n\npub async fn {}() -> Result<impl IntoResponse, AppError> {{\n    Ok(\"ok\")\n}}\n",
-                config.name
-            )
+        let entry_point_node = ctx.graph.nodes.iter()
+            .find(|n| n.template_id.as_str() == "core.entry_point");
+        let framework = entry_point_node
+            .and_then(|n| n.config.get("framework").and_then(|f| f.as_str()))
+            .unwrap_or("axum");
+
+        let source = if framework == "actix" {
+            if uses.is_empty() {
+                format!(
+                    "use actix_web::Responder;\nuse crate::errors::AppError;\n\npub async fn {}() -> Result<impl Responder, AppError> {{\n    Ok(\"ok\")\n}}\n",
+                    config.name
+                )
+            } else {
+                format!(
+                    "use actix_web::Responder;\nuse crate::errors::AppError;\n{}\npub async fn {}() -> Result<impl Responder, AppError> {{\n{}    Ok(\"ok\")\n}}\n",
+                    uses, config.name, body
+                )
+            }
         } else {
-            format!(
-                "use axum::response::IntoResponse;\nuse crate::errors::AppError;\n{}\npub async fn {}() -> Result<impl IntoResponse, AppError> {{\n{}    Ok(\"ok\")\n}}\n",
-                uses, config.name, body
-            )
+            if uses.is_empty() {
+                format!(
+                    "use axum::response::IntoResponse;\nuse crate::errors::AppError;\n\npub async fn {}() -> Result<impl IntoResponse, AppError> {{\n    Ok(\"ok\")\n}}\n",
+                    config.name
+                )
+            } else {
+                format!(
+                    "use axum::response::IntoResponse;\nuse crate::errors::AppError;\n{}\npub async fn {}() -> Result<impl IntoResponse, AppError> {{\n{}    Ok(\"ok\")\n}}\n",
+                    uses, config.name, body
+                )
+            }
         };
 
         Ok(crate::templates::codegen::RuntimeEmission {
@@ -381,6 +533,8 @@ struct CoreServiceConfig {
     name: String,
     #[serde(default)]
     description: String,
+    /// Optional custom Rust source code. If present, emitted verbatim.
+    code: Option<String>,
 }
 
 pub struct CoreService {
@@ -425,6 +579,20 @@ impl NodeTemplate for CoreService {
     ) -> Result<crate::templates::codegen::RuntimeEmission, crate::templates::TemplateError> {
         let config: CoreServiceConfig = serde_json::from_value(ctx.node.config.clone())
             .map_err(|e| crate::templates::TemplateError::ConfigMismatch(e.to_string()))?;
+
+        if let Some(ref custom_code) = config.code {
+            return Ok(crate::templates::codegen::RuntimeEmission {
+                items: vec![crate::templates::codegen::EmittedItem {
+                    module_path: format!("services/{}.rs", config.name),
+                    source: custom_code.clone(),
+                }],
+                dependencies: vec![
+                    ("once_cell".to_string(), "1.18".to_string()),
+                    ("futures".to_string(), "0.3".to_string()),
+                ],
+                debug_site: None,
+            });
+        }
 
         let mut uses = String::new();
         let mut body = String::new();
@@ -1125,6 +1293,7 @@ mod tests {
                 "grpc.client",
                 "grpc.server",
                 "http.handler",
+                "http.middleware",
                 "http.route",
                 "integration.consumer.placeholder",
                 "integration.db_writer",
@@ -1146,6 +1315,14 @@ mod tests {
                 "language.pointer",
                 "language.propagate",
                 "language.struct",
+                "marketplace.clickhouse",
+                "marketplace.mongodb",
+                "marketplace.nats",
+                "marketplace.rabbitmq",
+                "marketplace.s3",
+                "marketplace.scylladb",
+                "marketplace.surrealdb",
+                "marketplace.webrtc",
                 "observability.logger",
                 "parser.json",
                 "parser.protobuf",
@@ -1173,7 +1350,7 @@ mod tests {
             ],
             "expected exact set of builtin ids (sorted lexicographically by summaries())"
         );
-        assert_eq!(r.len(), 52);
+        assert_eq!(r.len(), 61);
     }
 
     #[test]

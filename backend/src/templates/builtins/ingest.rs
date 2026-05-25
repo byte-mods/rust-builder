@@ -12,10 +12,11 @@ use super::{id_or_panic, schema_value, to_snake_case};
 
 // ---- integration.scheduler ------------------------------------------------
 
-#[derive(Debug, JsonSchema, Deserialize)]
+#[derive(Debug, JsonSchema, Deserialize, Default)]
 #[allow(dead_code)]
 pub struct SchedulerConfig {
     /// Cron expression (5-field or 6-field standard).
+    #[serde(default)]
     pub cron: String,
     /// Snake_case module name for the generated scheduler. Defaults to "scheduler".
     #[serde(default)]
@@ -140,10 +141,11 @@ pub async fn run() {{
 
 // ---- integration.file_tail -------------------------------------------------
 
-#[derive(Debug, JsonSchema, Deserialize)]
+#[derive(Debug, JsonSchema, Deserialize, Default)]
 #[allow(dead_code)]
 pub struct FileTailConfig {
     /// Path of the file to tail.
+    #[serde(default)]
     pub file_path: String,
     /// Poll interval in milliseconds to check for new lines.
     #[serde(default = "default_poll_interval")]
@@ -320,8 +322,11 @@ mod tests {
         // Happy path
         assert!(registry.validate(&id, &json!({"cron": "0 * * * * *", "name": "my_job"})).is_ok());
         
-        // Missing required field "cron"
-        assert!(registry.validate(&id, &json!({"name": "job"})).is_err());
+        // Missing "cron" is allowed (defaults to empty string)
+        assert!(registry.validate(&id, &json!({"name": "job"})).is_ok());
+
+        // Invalid type for "cron" (expected string, got number)
+        assert!(registry.validate(&id, &json!({"cron": 12345})).is_err());
     }
 
     #[test]

@@ -49,8 +49,11 @@ pub fn baseline_dependencies() -> DepMap {
 /// template hints — duplicates against the baseline lose silently
 /// (baseline wins; cargo's resolver decides actual versions at build
 /// time).
-pub fn render(slug: &Slug, extra_deps: &[(String, String)]) -> String {
+pub fn render(slug: &Slug, extra_deps: &[(String, String)], framework: &str) -> String {
     let mut deps = baseline_dependencies();
+    if framework == "actix" || framework == "none" {
+        deps.remove("axum");
+    }
     for (name, version) in extra_deps {
         deps.entry(name.clone()).or_insert_with(|| {
             // Quote bare versions like "1.2" — table-form values
@@ -104,14 +107,14 @@ mod tests {
 
     #[test]
     fn test_baseline_render_is_deterministic() {
-        let a = render(&slug("svc"), &[]);
-        let b = render(&slug("svc"), &[]);
+        let a = render(&slug("svc"), &[], "axum");
+        let b = render(&slug("svc"), &[], "axum");
         assert_eq!(a, b);
     }
 
     #[test]
     fn test_render_includes_baseline_deps() {
-        let out = render(&slug("svc"), &[]);
+        let out = render(&slug("svc"), &[], "axum");
         for crate_name in &["tokio", "axum", "serde", "tracing", "thiserror"] {
             assert!(
                 out.contains(&format!("{crate_name} = ")),
@@ -126,7 +129,7 @@ mod tests {
             ("rdkafka".to_string(), "0.36".to_string()),
             ("tokio".to_string(), "1.99".to_string()), // conflict — baseline wins
         ];
-        let out = render(&slug("svc"), &extras);
+        let out = render(&slug("svc"), &extras, "axum");
         assert!(out.contains("rdkafka = \"0.36\""));
         // Baseline tokio entry has table form — confirm it survived.
         assert!(out.contains("tokio = { version = \"1\""));
@@ -135,7 +138,7 @@ mod tests {
 
     #[test]
     fn test_dash_in_slug_becomes_underscore_in_crate_name() {
-        let out = render(&slug("user-service"), &[]);
+        let out = render(&slug("user-service"), &[], "axum");
         assert!(out.contains("name = \"user_service\""));
         // The slug itself (with dashes) must NOT appear as the package
         // name — Cargo crates can't have dashes in `name`.
@@ -144,7 +147,7 @@ mod tests {
 
     #[test]
     fn test_lib_and_bin_both_present() {
-        let out = render(&slug("svc"), &[]);
+        let out = render(&slug("svc"), &[], "axum");
         assert!(out.contains("[lib]"));
         assert!(out.contains("[[bin]]"));
     }

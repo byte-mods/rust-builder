@@ -20,6 +20,7 @@ pub use collab::{collab_ws, CollabManager};
 pub use handlers::projects_router;
 pub use store::ProjectStore;
 pub use types::{
-    Edge, EdgeId, Graph, Node, NodeId, NodeKind, Position, Project, ProjectMeta, Slug, SlugError,
-    GRAPH_SCHEMA_VERSION, PROJECT_SCHEMA_VERSION,
+    Edge, EdgeId, Graph, Node, NodeId, NodeKind, Package, PackageId, PackageSlug,
+    PackageTreeError, Position, Project, ProjectMeta, Slug, SlugError, GRAPH_SCHEMA_VERSION,
+    PROJECT_SCHEMA_VERSION,
 };

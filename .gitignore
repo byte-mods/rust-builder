@@ -6,6 +6,10 @@ target/
 projects/*/target/
 **/*.rs.bk
 
+# Generated user-projects (created by studio tests + manual runs).
+# These are studio output, not studio source.
+backend/projects/*/
+
 # Node / frontend.
 node_modules/
 dist/

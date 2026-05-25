@@ -16,14 +16,17 @@ use super::{id_or_panic, schema_value, to_snake_case};
 
 // ---- integration.kafka_consumer -------------------------------------------
 
-#[derive(Debug, JsonSchema, Deserialize)]
+#[derive(Debug, JsonSchema, Deserialize, Default)]
 #[allow(dead_code)]
 pub struct KafkaConsumerConfig {
     /// Kafka brokers comma-separated list, e.g. localhost:9092.
+    #[serde(default)]
     pub brokers: String,
     /// Topic name to poll from.
+    #[serde(default)]
     pub topic: String,
     /// Consumer group identifier.
+    #[serde(default)]
     pub group: String,
     /// Snake_case module name. Defaults to topic name with dashes replaced by underscores.
     #[serde(default)]
@@ -77,7 +80,13 @@ impl NodeTemplate for IntegrationKafkaConsumer {
         let config: KafkaConsumerConfig = serde_json::from_value(ctx.node.config.clone())
             .map_err(|e| TemplateError::ConfigMismatch(e.to_string()))?;
 
-        let name = config.name.unwrap_or_else(|| config.topic.replace('-', "_"));
+        let name = config.name.unwrap_or_else(|| {
+            if config.topic.is_empty() {
+                "kafka_consumer".to_string()
+            } else {
+                config.topic.replace('-', "_")
+            }
+        });
         let brokers = config.brokers;
         let topic = config.topic;
         let group = config.group;
@@ -181,12 +190,14 @@ pub async fn run() {{
 
 // ---- integration.kafka_producer -------------------------------------------
 
-#[derive(Debug, JsonSchema, Deserialize)]
+#[derive(Debug, JsonSchema, Deserialize, Default)]
 #[allow(dead_code)]
 pub struct KafkaProducerConfig {
     /// Kafka brokers comma-separated list.
+    #[serde(default)]
     pub brokers: String,
     /// Topic name to publish messages to.
+    #[serde(default)]
     pub topic: String,
     /// Snake_case module name. Defaults to "kafka_producer".
     #[serde(default)]
@@ -259,13 +270,13 @@ pub async fn send_message(payload: String) -> Result<String, AppError> {{
         .set("bootstrap.servers", brokers)
         .set("message.timeout.ms", "5000")
         .create()
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
 
     let record = FutureRecord::to(topic).payload(&payload).key("");
     
     match producer.send(record, Duration::from_secs(0)).await {{
         Ok((partition, offset)) => Ok(format!("Ack: Sent to partition {{}} at offset {{}}", partition, offset)),
-        Err((e, _)) => Err(AppError::Internal(e.to_string())),
+        Err((e, _)) => Err(AppError::BadRequest(e.to_string())),
     }}
 }}
 "#,
@@ -288,12 +299,14 @@ pub async fn send_message(payload: String) -> Result<String, AppError> {{
 
 // ---- integration.redis ----------------------------------------------------
 
-#[derive(Debug, JsonSchema, Deserialize)]
+#[derive(Debug, JsonSchema, Deserialize, Default)]
 #[allow(dead_code)]
 pub struct RedisConfig {
     /// Redis connection string, e.g. redis://127.0.0.1:6379.
+    #[serde(default)]
     pub connection_string: String,
     /// Operation to perform (GET or SET).
+    #[serde(default)]
     pub operation: String,
     /// Snake_case module name. Defaults to "redis_client".
     #[serde(default)]
@@ -359,16 +372,16 @@ pub async fn execute(key: String, value: String) -> Result<String, AppError> {{
     let op = "{operation}";
     info!(%connection_string, op, %key, "connecting and executing Redis command");
 
-    let client = redis::Client::open(connection_string).map_err(|e| AppError::Internal(e.to_string()))?;
-    let mut con = client.get_multiplexed_tokio_connection().await.map_err(|e| AppError::Internal(e.to_string()))?;
+    let client = redis::Client::open(connection_string).map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let mut con = client.get_multiplexed_tokio_connection().await.map_err(|e| AppError::BadRequest(e.to_string()))?;
 
     if op == "SET" {{
         info!(%key, "storing value in Redis cache");
-        let _: () = con.set(&key, value).await.map_err(|e| AppError::Internal(e.to_string()))?;
+        let _: () = con.set(&key, value).await.map_err(|e| AppError::BadRequest(e.to_string()))?;
         Ok(format!("OK - stored '{{}}'", key))
     }} else {{
         info!(%key, "retrieving value from Redis cache");
-        let result: String = con.get(&key).await.map_err(|e| AppError::Internal(e.to_string()))?;
+        let result: String = con.get(&key).await.map_err(|e| AppError::BadRequest(e.to_string()))?;
         Ok(result)
     }}
 }}
@@ -392,12 +405,14 @@ pub async fn execute(key: String, value: String) -> Result<String, AppError> {{
 
 // ---- integration.sql_connector --------------------------------------------
 
-#[derive(Debug, JsonSchema, Deserialize)]
+#[derive(Debug, JsonSchema, Deserialize, Default)]
 #[allow(dead_code)]
 pub struct SqlConnectorConfig {
     /// PostgreSQL/SQL connection string.
+    #[serde(default)]
     pub connection_string: String,
     /// SQL statement with parameter placeholders.
+    #[serde(default)]
     pub query: String,
     /// Snake_case module name. Defaults to "sql_connector".
     #[serde(default)]
@@ -467,7 +482,7 @@ pub async fn execute(params: Vec<String>) -> Result<String, AppError> {{
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect(connection_string).await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
 
     // Since we are generating generic SQL execution, we use sqlx::query
     let mut q = sqlx::query(query_str);
@@ -476,7 +491,7 @@ pub async fn execute(params: Vec<String>) -> Result<String, AppError> {{
     }}
     
     // As a generic connector, we just execute it and return affected rows.
-    let result = q.execute(&pool).await.map_err(|e| AppError::Internal(e.to_string()))?;
+    let result = q.execute(&pool).await.map_err(|e| AppError::BadRequest(e.to_string()))?;
     
     Ok(format!("[{{{{\"status\": \"success\", \"rows_affected\": {{}}, \"params_used\": {{:?}}}}}}]", result.rows_affected(), params))
 }}

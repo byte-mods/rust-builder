@@ -12,21 +12,24 @@ use super::{id_or_panic, schema_value, to_snake_case};
 
 // ---- integration.http_client ----------------------------------------------
 
-#[derive(Debug, JsonSchema, Deserialize)]
+#[derive(Debug, JsonSchema, Deserialize, Default)]
 #[allow(dead_code)]
 pub struct HttpClientConfig {
     /// Outbound URL endpoint.
+    #[serde(default)]
     pub url: String,
     /// HTTP method to use.
+    #[serde(default)]
     pub method: HttpMethod,
     /// Snake_case module name. Defaults to "http_client".
     #[serde(default)]
     pub name: Option<String>,
 }
 
-#[derive(Debug, JsonSchema, Deserialize, PartialEq, Eq)]
+#[derive(Debug, JsonSchema, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum HttpMethod {
+    #[default]
     Get,
     Post,
 }
@@ -143,12 +146,14 @@ pub async fn send_request(body: &str) -> Result<String, AppError> {{
 
 // ---- integration.db_writer -------------------------------------------------
 
-#[derive(Debug, JsonSchema, Deserialize)]
+#[derive(Debug, JsonSchema, Deserialize, Default)]
 #[allow(dead_code)]
 pub struct DbWriterConfig {
     /// SQLite database file path.
+    #[serde(default)]
     pub db_path: String,
     /// SQL insert / update query with ? parameter placeholders.
+    #[serde(default)]
     pub query: String,
     /// Snake_case module name. Defaults to "db_writer".
     #[serde(default)]
@@ -314,8 +319,11 @@ mod tests {
         // Happy path
         assert!(registry.validate(&id, &json!({"db_path": "db.sqlite", "query": "INSERT INTO t VALUES (?1)"})).is_ok());
         
-        // Missing required field "query"
-        assert!(registry.validate(&id, &json!({"db_path": "db.sqlite"})).is_err());
+        // Missing "query" is allowed (defaults to empty string)
+        assert!(registry.validate(&id, &json!({"db_path": "db.sqlite"})).is_ok());
+
+        // Invalid type for "query" (expected string, got number)
+        assert!(registry.validate(&id, &json!({"query": 12345})).is_err());
     }
 
     #[test]

@@ -22,6 +22,98 @@ const RESERVED_NAMES = new Set([
   "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
 ]);
 
+interface Template {
+  id: string;
+  name: string;
+  icon: string;
+  description: string;
+  tech: string[];
+  defaultSlug: string;
+  defaultName: string;
+  gradient: string;
+  shadowColor: string;
+}
+
+const TEMPLATES: Template[] = [
+  {
+    id: "order_processor",
+    name: "Enterprise Order Processor (Premium Flow)",
+    icon: "⚡",
+    description: "The ultimate visual low-code showcase. A fully connected multi-node flow containing HTTP routes, visual If/Else logic, local SQLite Database persistence, Redis caching, Kafka Event Publishing, a background Kafka Consumer worker, and a Database Cleanup Cron Scheduler. 100% visual, 100% green compilation out-of-the-box.",
+    tech: ["Axum Web", "Visual If/Else", "SQLite Database", "Redis Cache", "Kafka Publisher", "Kafka Consumer", "Cron Scheduler"],
+    defaultSlug: "order-processor",
+    defaultName: "Enterprise Order Processor",
+    gradient: "linear-gradient(135deg, #FF3366, #FF9933)",
+    shadowColor: "rgba(255, 51, 102, 0.4)",
+  },
+  {
+    id: "task_manager",
+    name: "Axum Task Manager API",
+    icon: "✅",
+    description: "A 100% self-contained, compilable REST API with modular folders. Demonstrates Axum router endpoints, authorization middlewares, and thread-safe global in-memory state services that compile cleanly out-of-the-box.",
+    tech: ["Axum Web", "In-Memory Store", "Custom Middleware", "Modular Folders", "DTO Schemas"],
+    defaultSlug: "task-manager-api",
+    defaultName: "Task Manager API",
+    gradient: "linear-gradient(135deg, #00c6ff, #0072ff)",
+    shadowColor: "rgba(0, 198, 255, 0.4)",
+  },
+  {
+    id: "ecommerce",
+    name: "Actix E-Commerce Backend",
+    icon: "🛍️",
+    description: "Production Actix HTTP backend pre-wired with MongoDB multi-document transactions & Redis cache. Includes 10 routes (signup, login, local disk file uploads, caching, and conflict retry loops).",
+    tech: ["Actix Web", "MongoDB", "Redis", "Bearer Token", "Transactions", "File tail"],
+    defaultSlug: "ecommerce-backend",
+    defaultName: "E-Commerce Backend",
+    gradient: "linear-gradient(135deg, #FF6B6B, #FF8E53)",
+    shadowColor: "rgba(255, 107, 107, 0.4)",
+  },
+  {
+    id: "webrtc",
+    name: "WebRTC Collaboration Hub",
+    icon: "📞",
+    description: "Real-time communication workspace with WebRTC signaling connection brokering and NATS subscription/publishing broker.",
+    tech: ["Actix Web", "WebRTC Peers", "NATS PubSub", "Signaling"],
+    defaultSlug: "webrtc-hub",
+    defaultName: "WebRTC Collaboration Hub",
+    gradient: "linear-gradient(135deg, #4facfe, #00f2fe)",
+    shadowColor: "rgba(79, 172, 254, 0.4)",
+  },
+  {
+    id: "analytics",
+    name: "ScyllaDB Analytics Streamer",
+    icon: "📊",
+    description: "Columnar analytical processor using ClickHouse big-data SQL, ScyllaDB columnar tables, and Kafka topic streaming.",
+    tech: ["Actix Web", "ScyllaDB NoSQL", "ClickHouse Analytics", "Kafka"],
+    defaultSlug: "analytics-streamer",
+    defaultName: "Analytics Streamer",
+    gradient: "linear-gradient(135deg, #a8ff78, #78ffd6)",
+    shadowColor: "rgba(120, 255, 214, 0.4)",
+  },
+  {
+    id: "s3",
+    name: "AWS S3 Multi-tenant Cloud",
+    icon: "📦",
+    description: "Secure multi-tenant file cloud hosting using SurrealDB multi-model queries and AWS S3 storage buckets.",
+    tech: ["Actix Web", "AWS S3 Cloud", "SurrealDB Graph DB"],
+    defaultSlug: "s3-cloud-storage",
+    defaultName: "S3 Cloud Storage",
+    gradient: "linear-gradient(135deg, #f093fb, #f5576c)",
+    shadowColor: "rgba(240, 147, 251, 0.4)",
+  },
+  {
+    id: "rabbitmq",
+    name: "RabbitMQ Microservice Streamer",
+    icon: "🐇",
+    description: "Event-driven microservice system utilizing RabbitMQ queue broker routing, SQLite auditing, and cron scheduling.",
+    tech: ["Actix Web", "RabbitMQ AMQP", "SQLite Writer", "Cron Scheduler"],
+    defaultSlug: "rabbitmq-streamer",
+    defaultName: "RabbitMQ Event Streamer",
+    gradient: "linear-gradient(135deg, #f6d365, #fda085)",
+    shadowColor: "rgba(254, 160, 133, 0.4)",
+  },
+];
+
 interface ProjectListProps {
   /** Asked to open a project's canvas. */
   onOpen: (slug: string) => void;
@@ -39,6 +131,7 @@ export default function ProjectList({ onOpen }: ProjectListProps): JSX.Element {
   const [state, setState] = useState<FetchState>({ kind: "loading" });
   const [createSlug, setCreateSlug] = useState("");
   const [createName, setCreateName] = useState("");
+  const [selectedTemplate, setSelectedTemplate] = useState<string | undefined>(undefined);
   const [createBusy, setCreateBusy] = useState(false);
   const [createErr, setCreateErr] = useState<string | null>(null);
   const [refreshTick, setRefreshTick] = useState(0);
@@ -169,10 +262,11 @@ export default function ProjectList({ onOpen }: ProjectListProps): JSX.Element {
     const controller = new AbortController();
     createAbortRef.current = controller;
     setCreateBusy(true);
-    createProject(createSlug, createName.trim(), controller.signal)
+    createProject(createSlug, createName.trim(), selectedTemplate, controller.signal)
       .then(() => {
         setCreateSlug("");
         setCreateName("");
+        setSelectedTemplate(undefined);
         setRefreshTick((t) => t + 1);
       })
       .catch((err: unknown) => {
@@ -202,6 +296,13 @@ export default function ProjectList({ onOpen }: ProjectListProps): JSX.Element {
       });
   }
 
+  function selectTemplate(t: Template): void {
+    if (createBusy) return;
+    setSelectedTemplate(t.id);
+    setCreateSlug(t.defaultSlug);
+    setCreateName(t.defaultName);
+  }
+
   return (
     <div className="project-list">
       <section className="project-create">
@@ -212,7 +313,10 @@ export default function ProjectList({ onOpen }: ProjectListProps): JSX.Element {
             <input
               type="text"
               value={createSlug}
-              onChange={(e) => setCreateSlug(e.target.value)}
+              onChange={(e) => {
+                setCreateSlug(e.target.value);
+                setSelectedTemplate(undefined); // De-select template on manual edit
+              }}
               placeholder="user-service"
               autoComplete="off"
               disabled={createBusy}
@@ -223,7 +327,10 @@ export default function ProjectList({ onOpen }: ProjectListProps): JSX.Element {
             <input
               type="text"
               value={createName}
-              onChange={(e) => setCreateName(e.target.value)}
+              onChange={(e) => {
+                setCreateName(e.target.value);
+                setSelectedTemplate(undefined);
+              }}
               placeholder="User service"
               disabled={createBusy}
             />
@@ -299,6 +406,50 @@ export default function ProjectList({ onOpen }: ProjectListProps): JSX.Element {
             </tbody>
           </table>
         )}
+      </section>
+
+      <section className="template-section">
+        <h2>Blueprints & Starter Templates</h2>
+        <p className="muted" style={{ marginBottom: "1rem" }}>
+          Kickstart your application with one of our premium visual templates. Selecting a card pre-populates configuration variables and seeds fully functional visual graphs and database architectures immediately!
+        </p>
+        <div className="template-grid">
+          {TEMPLATES.map((t) => {
+            const isSelected = selectedTemplate === t.id;
+            return (
+              <div
+                key={t.id}
+                className={`template-card ${isSelected ? "selected" : ""}`}
+                onClick={() => selectTemplate(t)}
+                style={isSelected ? {
+                  borderColor: "transparent",
+                  boxShadow: `0 0 16px ${t.shadowColor}, 0 4px 20px rgba(0,0,0,0.4)`
+                } : {}}
+              >
+                <div
+                  className="template-card-glow"
+                  style={{
+                    background: t.gradient,
+                  }}
+                />
+                <div className="template-card-content">
+                  <div className="template-header">
+                    <span className="template-icon">{t.icon}</span>
+                    <h3 className="template-title">{t.name}</h3>
+                  </div>
+                  <p className="template-desc">{t.description}</p>
+                  <div className="template-tech-wrap">
+                    {t.tech.map((techItem) => (
+                      <span key={techItem} className="template-tech-tag">
+                        {techItem}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
       </section>
     </div>
   );

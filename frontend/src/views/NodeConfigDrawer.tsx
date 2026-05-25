@@ -13,6 +13,7 @@ interface NodeConfigDrawerProps {
   diagnostics: ParsedDiagnostic[];
   onChange: (config: unknown) => void;
   onClose: () => void;
+  onDelete?: () => void;
 }
 
 /// Side panel that opens when a node is selected on the canvas.
@@ -28,6 +29,7 @@ export default function NodeConfigDrawer({
   diagnostics,
   onChange,
   onClose,
+  onDelete,
 }: NodeConfigDrawerProps): JSX.Element {
   const template = useMemo(
     () => templates.find((t) => t.id === templateId),
@@ -91,6 +93,41 @@ export default function NodeConfigDrawer({
             rows={3}
           />
         </div>
+
+        {onDelete && (
+          <div style={{ marginTop: "1.5rem", borderTop: "1px solid rgba(239, 68, 68, 0.2)", paddingTop: "1rem" }}>
+            <button
+              type="button"
+              onClick={onDelete}
+              style={{
+                width: "100%",
+                padding: "0.6rem",
+                borderRadius: "6px",
+                border: "1px solid #ef4444",
+                background: "rgba(239, 68, 68, 0.1)",
+                color: "#f87171",
+                fontWeight: 600,
+                fontSize: "0.82rem",
+                cursor: "pointer",
+                transition: "all 0.2s ease",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: "0.4rem"
+              }}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.background = "#ef4444";
+                e.currentTarget.style.color = "white";
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.background = "rgba(239, 68, 68, 0.1)";
+                e.currentTarget.style.color = "#f87171";
+              }}
+            >
+              🗑️ Delete Node
+            </button>
+          </div>
+        )}
       </div>
     </aside>
   );

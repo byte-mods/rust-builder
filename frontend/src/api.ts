@@ -267,10 +267,11 @@ export async function listProjects(signal?: AbortSignal): Promise<ProjectMeta[]>
 export async function createProject(
   slug: string,
   name: string,
+  template?: string,
   signal?: AbortSignal,
 ): Promise<Project> {
   return request<Project>("POST", "/api/projects", {
-    body: { slug, name },
+    body: { slug, name, template },
     signal,
   });
 }
@@ -381,6 +382,10 @@ export function buildWebSocketUrl(slug: string): string {
   return `${wsBase()}/ws/build/${encodeURIComponent(slug)}`;
 }
 
+export function collabWebSocketUrl(slug: string): string {
+  return `${wsBase()}/ws/collab/${encodeURIComponent(slug)}`;
+}
+
 /// `POST /api/projects/:slug/build` — trigger a cargo check (or cargo build
 /// --release when `release` is true). Returns 202; output streams over WS.
 export async function triggerBuild(
@@ -484,10 +489,13 @@ export async function generateFlow(
   slug: string,
   prompt: string,
   history?: ChatMessage[],
+  provider?: string,
+  apiKey?: string,
+  model?: string,
   signal?: AbortSignal,
 ): Promise<Graph> {
   return request<Graph>("POST", `/api/projects/${encodeURIComponent(slug)}/llm/generate-flow`, {
-    body: { prompt, history },
+    body: { prompt, history, provider, api_key: apiKey, model },
     signal,
   });
 }
@@ -497,10 +505,13 @@ export async function refineFlow(
   slug: string,
   prompt: string,
   history?: ChatMessage[],
+  provider?: string,
+  apiKey?: string,
+  model?: string,
   signal?: AbortSignal,
 ): Promise<Graph> {
   return request<Graph>("POST", `/api/projects/${encodeURIComponent(slug)}/llm/refine-flow`, {
-    body: { prompt, history },
+    body: { prompt, history, provider, api_key: apiKey, model },
     signal,
   });
 }
@@ -583,6 +594,50 @@ export async function fetchDbSchema(
     `/api/projects/${encodeURIComponent(slug)}/db/schema`,
     {
       body: { connection_string: connectionString },
+      signal,
+    }
+  );
+}
+
+/// `GET /api/projects/:slug/marketplace` — fetch installed marketplace packages
+export async function fetchMarketplace(
+  slug: string,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  return request<string[]>(
+    "GET",
+    `/api/projects/${encodeURIComponent(slug)}/marketplace`,
+    { signal }
+  );
+}
+
+/// `POST /api/projects/:slug/marketplace/install` — install a marketplace package
+export async function installMarketplacePackage(
+  slug: string,
+  packageName: string,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  return request<string[]>(
+    "POST",
+    `/api/projects/${encodeURIComponent(slug)}/marketplace/install`,
+    {
+      body: { package: packageName },
+      signal,
+    }
+  );
+}
+
+/// `POST /api/projects/:slug/marketplace/uninstall` — uninstall a marketplace package
+export async function uninstallMarketplacePackage(
+  slug: string,
+  packageName: string,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  return request<string[]>(
+    "POST",
+    `/api/projects/${encodeURIComponent(slug)}/marketplace/uninstall`,
+    {
+      body: { package: packageName },
       signal,
     }
   );
