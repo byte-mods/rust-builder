@@ -62,6 +62,38 @@ Scope honesty: 10 sections, ~60 atomic tasks, multi-week. Foundation-first order
 
 ---
 
+## Scale-out via composition (the mental model)
+
+The studio is a **visual IDE where each file is a canvas instead of text**. The package tree on the left is the project's folder structure; clicking a package opens its canvas. Cross-package imports (Section 2) let one canvas reference a `pub` symbol declared in another, exactly like `use crate::other::Foo;` does in source.
+
+**Why composition raises the practical ceiling:**
+
+A single monolithic canvas of 50,000 nodes is unusable — you can't navigate, can't search, can't see the whole. The same 50,000 nodes split across ~100 packages of ~500 nodes each is comfortable. Developers already navigate large codebases this way: nobody scrolls through Kafka's source as one mega-file, they `Ctrl+P` to `LogSegment.rs`. The studio gives the same model with flowcharts instead of text.
+
+**Per-canvas sweet spot:** ~10–500 nodes per package. Above that, the canvas itself gets too dense — *but* you split the package into sub-packages and the problem disappears. The package tree is the dimension where complexity expands; each canvas stays focused.
+
+**What this changes for systems-of-systems work:**
+
+| System class | Realistic via composition? |
+|---|---|
+| HTTP services, microservices, gateways | Yes — already shipping today (Section 1) |
+| ETL pipelines, schedulers, batch jobs | Yes (Section 9) |
+| Custom message queues with replication, durable consumer groups | Yes — ~5–10K visual nodes split across ~50 packages |
+| Redis-like in-memory KV stores | Yes — ~2K nodes |
+| MQTT brokers, custom RPC frameworks | Yes — ~5K nodes |
+| Kafka-class distributed log (KRaft, log compaction, transactional EOS) | Borderline-yes — most logic visual, ~5–10% in `custom.block` for hot paths (zero-copy network I/O, SIMD, unsafe blocks) |
+| Postgres-class storage engines (MVCC, WAL, B+tree) | Yes with significant `custom.block` for index implementations |
+| Full Linux kernel network stack | No — text wins for code where every machine instruction matters |
+| Compilers, JITs, GCs, formal-proof engines | No — text-layout-as-abstraction; DSLs and macros beat visual nodes |
+
+**The 90/10 hybrid (this is healthy, not a bug):**
+
+Every real Rust codebase has ~10% specialised code — `unsafe` blocks, SIMD intrinsics, custom allocators, sub-microsecond hot loops. The studio's `custom.block` (S16) is the explicit escape hatch for that 10%. The remaining 90% — application logic, business rules, request handling, persistence, validation, orchestration, scheduling — is exactly what visual programming represents well. So the ceiling isn't "what can the studio express" but "where does visual stop beating text," and that line sits around the boundary between *application* engineering and *systems-primitive* engineering.
+
+**The composition story is the entire raison d'être** of the multi-package model (Section 1, just landed) plus cross-package imports (Section 2, next). Without these two, the studio is limited to single-microservice scale. With them, the practical ceiling becomes "production-quality systems of arbitrary size, minus the densest 5–10% which uses `custom.block`."
+
+---
+
 ## Architecture-neutrality test (gate for every section)
 
 Before any section closes, the following thought experiment must hold:

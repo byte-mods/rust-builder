@@ -28,8 +28,8 @@ use dashmap::DashMap;
 
 use crate::codegen::{GenerateReport, Generator};
 use crate::error::ApiError;
-use crate::projects::types::Graph;
-use crate::projects::Slug;
+use crate::projects::types::{Graph, Project};
+use crate::projects::{PackageSlug, Slug};
 
 /// Outcome of a `regen_if_changed` call. `regenerated` is the contract the
 /// caller uses to decide whether to log "regen complete" vs. "skipped";
@@ -88,6 +88,61 @@ impl CodegenCache {
             }
         }
         let report = generator.generate_project(slug, graph).await?;
+        self.last_hash.insert(slug.clone(), new_hash);
+        Ok(RegenOutcome {
+            regenerated: true,
+            report: Some(report),
+        })
+    }
+
+    /// Tree-aware regen for multi-package projects (Section 1 T4+).
+    ///
+    /// Hashes every package's graph in combination so a change in any
+    /// child busts the cache. Dispatches to
+    /// [`Generator::generate_project_tree`] which writes nested
+    /// `mod.rs` files for every non-root package and splices their
+    /// `pub mod` declarations into the parent's region.
+    ///
+    /// Callers that still operate on a single graph (e.g. the import
+    /// path, which only carries the root graph) can keep using
+    /// [`Self::regen_if_changed`]; the tree variant is preferred for
+    /// all post-T4 production paths (build / run / test / debug).
+    pub async fn regen_if_changed_tree(
+        &self,
+        generator: &Generator,
+        slug: &Slug,
+        project: &Project,
+        graphs: &std::collections::HashMap<PackageSlug, Graph>,
+    ) -> Result<RegenOutcome, ApiError> {
+        // Combine every package's graph into one deterministic hash.
+        // Package order is sorted by slug for stability — see the
+        // module-level "Hash determinism" doc.
+        let mut keyed: Vec<(&str, &Graph)> = graphs
+            .iter()
+            .map(|(k, v)| (k.as_str(), v))
+            .collect();
+        keyed.sort_by(|a, b| a.0.cmp(b.0));
+        let mut hasher = DefaultHasher::new();
+        for (pkg_slug, graph) in keyed {
+            let bytes = serde_json::to_vec(graph).map_err(|e| {
+                ApiError::Internal(format!("graph serialise for hash failed: {e}"))
+            })?;
+            hasher.write(pkg_slug.as_bytes());
+            hasher.write_u8(0);
+            hasher.write(&bytes);
+        }
+        let new_hash = hasher.finish();
+        if let Some(existing) = self.last_hash.get(slug) {
+            if *existing == new_hash {
+                return Ok(RegenOutcome {
+                    regenerated: false,
+                    report: None,
+                });
+            }
+        }
+        let report = generator
+            .generate_project_tree(slug, project, graphs)
+            .await?;
         self.last_hash.insert(slug.clone(), new_hash);
         Ok(RegenOutcome {
             regenerated: true,

@@ -17,8 +17,13 @@ import {
 import {
   ApiError,
   EMPTY_GRAPH,
-  loadGraph,
-  saveGraph,
+  loadPackageGraph,
+  savePackageGraph,
+  listPackages,
+  createPackage,
+  renamePackage,
+  deletePackage,
+  type Package,
   buildWebSocketUrl,
   collabWebSocketUrl,
   triggerBuild,
@@ -47,6 +52,10 @@ import NodeConfigDrawer from "./NodeConfigDrawer";
 import EntryPointNode from "./EntryPointNode";
 import StudioNode from "./StudioNode";
 import { SecurityDrawer } from "./SecurityDrawer";
+import { PackageTree } from "./PackageTree";
+
+/// Slug of the root package — must match `backend::projects::types::ROOT_PACKAGE_SLUG`.
+const ROOT_PACKAGE_SLUG = "main";
 
 
 const MARKETPLACE_CATALOG = [
@@ -247,6 +256,15 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
   const [state, setState] = useState<LoadState>({ kind: "loading" });
   const [templates, setTemplates] = useState<Template[]>([]);
   const [diagnostics, setDiagnostics] = useState<ParsedDiagnostic[]>([]);
+
+  // T5: package-tree state. `currentPackage` is the slug whose graph is
+  // currently being edited on the canvas. Switching it reloads the
+  // graph from `/packages/<slug>/graph`. `packages` is the flat list
+  // returned by the backend's `list_packages` endpoint; the sidebar
+  // re-derives the tree shape from it.
+  const [currentPackage, setCurrentPackage] = useState<string>(ROOT_PACKAGE_SLUG);
+  const [packages, setPackages] = useState<Package[]>([]);
+  const [packageError, setPackageError] = useState<string | null>(null);
 
   const [nodes, setNodes, onNodesChange] = useNodesState<Node<NodeData>>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
@@ -684,7 +702,7 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
   async function handleAcceptProposed() {
     if (!proposedGraph) return;
     try {
-      await saveGraph(slug, proposedGraph);
+      await savePackageGraph(slug, currentPackage, proposedGraph);
       setState({ kind: "ready", graph: proposedGraph });
       setNodes(proposedGraph.nodes.map((node) => toRfNode(node, templates, diagnostics)));
       setEdges(proposedGraph.edges.map(toRfEdge));
@@ -858,10 +876,14 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
     }
   }
 
-  // Load graph on mount.
+  // Load graph on mount AND whenever the user switches the active
+  // package via the sidebar. The legacy `loadGraph` shim still works
+  // for the root package, but going through the per-package endpoint
+  // uniformly means children just work without a branch.
   useEffect(() => {
     const controller = new AbortController();
-    loadGraph(slug, controller.signal)
+    setState({ kind: "loading" });
+    loadPackageGraph(slug, currentPackage, controller.signal)
       .then((graph) => {
         setState({ kind: "ready", graph });
         setNodes(graph.nodes.map((node) => toRfNode(node, templates, diagnostics)));
@@ -869,11 +891,107 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
       })
       .catch((err: unknown) => {
         if (err instanceof DOMException && err.name === "AbortError") return;
+        // A package created via T3 may not yet have a graph file on
+        // disk; the backend returns 404 in that case. Treat it as an
+        // empty canvas rather than an error — the next save creates
+        // the file.
+        if (err instanceof ApiError && err.code === "not_found") {
+          setState({ kind: "ready", graph: EMPTY_GRAPH });
+          setNodes([]);
+          setEdges([]);
+          return;
+        }
         const message = err instanceof ApiError ? err.message : "unknown error";
         setState({ kind: "error", message });
       });
     return () => controller.abort();
-  }, [slug, setNodes, setEdges]);
+  }, [slug, currentPackage, setNodes, setEdges]);
+
+  // Load package list on mount + whenever `slug` changes. Kept
+  // separate from the graph effect so a per-package switch (cheap)
+  // doesn't refetch the tree.
+  useEffect(() => {
+    const controller = new AbortController();
+    listPackages(slug, controller.signal)
+      .then(setPackages)
+      .catch((err: unknown) => {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        // Don't blow up the whole canvas if the package list fails —
+        // surface inline in the sidebar and let the user retry.
+        const message = err instanceof ApiError ? err.message : "unknown error";
+        setPackageError(`Failed to load packages: ${message}`);
+      });
+    return () => controller.abort();
+  }, [slug]);
+
+  // Package-tree action handlers. Each call optimistically refetches
+  // the list on success so the sidebar reflects the new server state
+  // without manual array manipulation. If the chosen package is
+  // deleted, fall back to root.
+  const refreshPackages = useCallback(async () => {
+    try {
+      const next = await listPackages(slug);
+      setPackages(next);
+      setPackageError(null);
+    } catch (err) {
+      const message = err instanceof ApiError ? err.message : "unknown error";
+      setPackageError(message);
+    }
+  }, [slug]);
+
+  const handleCreatePackage = useCallback(
+    async (parentId: string | null, newSlug: string) => {
+      try {
+        await createPackage(slug, {
+          slug: newSlug,
+          parent_id: parentId ?? undefined,
+        });
+        await refreshPackages();
+      } catch (err) {
+        const message = err instanceof ApiError ? err.message : "unknown error";
+        setPackageError(`Create failed: ${message}`);
+      }
+    },
+    [slug, refreshPackages],
+  );
+
+  const handleRenamePackage = useCallback(
+    async (pkgSlug: string, newSlug: string) => {
+      if (pkgSlug === newSlug) return;
+      try {
+        await renamePackage(slug, pkgSlug, { slug: newSlug });
+        await refreshPackages();
+        // If we just renamed the currently-selected package, follow
+        // it to the new slug so the canvas doesn't try to load a
+        // stale path.
+        if (currentPackage === pkgSlug) {
+          setCurrentPackage(newSlug);
+        }
+      } catch (err) {
+        const message = err instanceof ApiError ? err.message : "unknown error";
+        setPackageError(`Rename failed: ${message}`);
+      }
+    },
+    [slug, currentPackage, refreshPackages],
+  );
+
+  const handleDeletePackage = useCallback(
+    async (pkgSlug: string) => {
+      try {
+        await deletePackage(slug, pkgSlug);
+        // If the deleted package was selected (or an ancestor of the
+        // selected one), fall back to root.
+        if (currentPackage === pkgSlug) {
+          setCurrentPackage(ROOT_PACKAGE_SLUG);
+        }
+        await refreshPackages();
+      } catch (err) {
+        const message = err instanceof ApiError ? err.message : "unknown error";
+        setPackageError(`Delete failed: ${message}`);
+      }
+    },
+    [slug, currentPackage, refreshPackages],
+  );
 
   // Load templates for config drawer.
   useEffect(() => {
@@ -1097,7 +1215,7 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
           nodes: nextNodes.map(fromRfNode),
           edges: nextEdges.map(fromRfEdge),
         };
-        saveGraph(slug, graph).then(() => {
+        savePackageGraph(slug, currentPackage, graph).then(() => {
           setSaveStatus("saved");
           if (collabWsRef.current && collabWsRef.current.readyState === WebSocket.OPEN) {
             collabWsRef.current.send(JSON.stringify({
@@ -1130,7 +1248,7 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
         nodes: nodes.map(fromRfNode),
         edges: edges.map(fromRfEdge),
       };
-      await saveGraph(slug, graph);
+      await savePackageGraph(slug, currentPackage, graph);
       setSaveStatus("saved");
       if (collabWsRef.current && collabWsRef.current.readyState === WebSocket.OPEN) {
         collabWsRef.current.send(JSON.stringify({
@@ -1805,6 +1923,15 @@ function ProjectCanvasInner({ slug, onBack }: ProjectCanvasProps): JSX.Element {
 
       {state.kind === "ready" && (
         <div className="project-canvas-body">
+          <PackageTree
+            packages={packages}
+            selectedSlug={currentPackage}
+            onSelect={setCurrentPackage}
+            onCreate={handleCreatePackage}
+            onRename={handleRenamePackage}
+            onDelete={handleDeletePackage}
+            errorMessage={packageError}
+          />
           <aside className="project-sidebar">
             <div className="sidebar-tab-header" style={{ display: "flex", borderBottom: "1px solid rgba(255,255,255,0.08)", background: "rgba(0,0,0,0.15)" }}>
               <button

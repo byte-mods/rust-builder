@@ -271,13 +271,15 @@ async fn build_project(
     // every other project-scoped endpoint.
     let _ = state.store.load(&slug).await?;
 
-    // S16: Regen first if the graph has changed since the last build
+    // S16+T4: regen the full package tree before cargo, only if
+    // something changed since the last build.
+    regen_project_tree_for_cargo(&state, &slug).await?;
+
+    // BuildManager needs the root graph for its diagnostic mapper.
+    // Reload after regen so the value reflects whatever the regen
+    // pass may have rewritten (currently a no-op, but keeps the
+    // semantics future-proof).
     let graph = state.store.load_graph(&slug).await?;
-    let generator = Generator::new(
-        Arc::clone(&state.registry),
-        state.store.root().to_path_buf(),
-    );
-    let _ = state.codegen_cache.regen_if_changed(&generator, &slug, &graph).await?;
 
     let project_dir = state.store.root().join(slug.as_str());
     let verb = if query.release {
@@ -303,15 +305,12 @@ async fn run_project(
     Path(slug): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let slug = parse_slug(&slug)?;
-    let _ = state.store.load(&slug).await?;
-
-    // S16: Regen first if the graph has changed since the last run
-    let graph = state.store.load_graph(&slug).await?;
-    let generator = Generator::new(
-        Arc::clone(&state.registry),
-        state.store.root().to_path_buf(),
-    );
-    let _ = state.codegen_cache.regen_if_changed(&generator, &slug, &graph).await?;
+    // S16+T6: regen the full package tree before cargo. Must use the
+    // tree-aware path so the shared cache key doesn't fight Build's
+    // tree-hash with Run's root-only hash — otherwise multi-package
+    // projects flip between layouts (super-qa MAJOR caught at S1
+    // section close).
+    regen_project_tree_for_cargo(&state, &slug).await?;
 
     let project_dir = state.store.root().join(slug.as_str());
     state
@@ -328,15 +327,9 @@ async fn test_project(
     Path(slug): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let slug = parse_slug(&slug)?;
-    let _ = state.store.load(&slug).await?;
-
-    // S16: Regen first if the graph has changed since the last test
+    // S16+T6: tree-aware regen (see run_project for the rationale).
+    regen_project_tree_for_cargo(&state, &slug).await?;
     let graph = state.store.load_graph(&slug).await?;
-    let generator = Generator::new(
-        Arc::clone(&state.registry),
-        state.store.root().to_path_buf(),
-    );
-    let _ = state.codegen_cache.regen_if_changed(&generator, &slug, &graph).await?;
 
     let project_dir = state.store.root().join(slug.as_str());
     state
@@ -363,15 +356,11 @@ async fn debug_project(
     body: Option<Json<StartDebugBody>>,
 ) -> Result<StatusCode, ApiError> {
     let slug = parse_slug(&slug)?;
-    let _ = state.store.load(&slug).await?;
-
-    // S16: Regen first if the graph has changed since the last debug run
+    // S16+T6: tree-aware regen (see run_project for the rationale).
+    regen_project_tree_for_cargo(&state, &slug).await?;
     let graph = state.store.load_graph(&slug).await?;
-    let generator = Generator::new(
-        Arc::clone(&state.registry),
-        state.store.root().to_path_buf(),
-    );
-    let _ = state.codegen_cache.regen_if_changed(&generator, &slug, &graph).await?;
+    // Suppress unused warning in branches that don't read `graph`.
+    let _ = &graph;
 
     let bps_str = body
         .and_then(|Json(b)| b.breakpoints)
@@ -496,6 +485,42 @@ async fn uninstall_marketplace_package(
 /// mapping doesn't drift across handlers.
 fn parse_slug(raw: &str) -> Result<Slug, ApiError> {
     Slug::new(raw).map_err(|e| ApiError::InvalidSlug(e.to_string()))
+}
+
+/// Shared regen-before-cargo path for Build / Run / Test / Debug.
+///
+/// Loads the full project + every package's graph (tolerating missing
+/// per-package graph files as empty), then routes through the
+/// tree-aware codegen cache so multi-package projects produce nested
+/// `src/<path>/mod.rs` files before cargo runs. Replaces the
+/// pre-Section-1 single-graph `regen_if_changed` flow.
+async fn regen_project_tree_for_cargo(
+    state: &AppState,
+    slug: &Slug,
+) -> Result<(), ApiError> {
+    let project = state.store.load(slug).await?;
+    let mut graphs: std::collections::HashMap<PackageSlug, Graph> =
+        std::collections::HashMap::with_capacity(project.packages.len());
+    for pkg in &project.packages {
+        match state.store.load_graph_for_package(slug, &pkg.slug).await {
+            Ok(g) => {
+                graphs.insert(pkg.slug.clone(), g);
+            }
+            // Missing per-package graph file is the expected state for
+            // a freshly-created child package — treat as empty graph.
+            Err(ApiError::NotFound) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    let generator = Generator::new(
+        Arc::clone(&state.registry),
+        state.store.root().to_path_buf(),
+    );
+    let _ = state
+        .codegen_cache
+        .regen_if_changed_tree(&generator, slug, &project, &graphs)
+        .await?;
+    Ok(())
 }
 
 /// Helper — `Path<String>` → `PackageSlug`. Reuses the same `invalid_slug`

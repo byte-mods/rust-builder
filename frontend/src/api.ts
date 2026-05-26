@@ -352,6 +352,111 @@ export async function saveGraph(
   });
 }
 
+// ---- Package CRUD (Section 1 T3) -------------------------------------------
+// A project is a tree of packages. Each package owns a graph fragment that
+// emits one Rust module (`src/<path>/mod.rs`). The root package's slug is
+// always `"main"`; user-created children sit underneath it. The frontend
+// uses these endpoints to drive the package-tree sidebar.
+
+/** Mirror of `backend::projects::types::Package`. */
+export interface Package {
+  id: string;
+  slug: string;
+  /** `null` for the root package; otherwise the parent's `id`. */
+  parent_id: string | null;
+  label?: string | null;
+}
+
+interface ListPackagesResponse {
+  packages: Package[];
+}
+
+/// `GET /api/projects/:slug/packages`.
+export async function listPackages(
+  slug: string,
+  signal?: AbortSignal,
+): Promise<Package[]> {
+  const resp = await request<ListPackagesResponse>(
+    "GET",
+    `/api/projects/${encodeURIComponent(slug)}/packages`,
+    { signal },
+  );
+  return resp.packages;
+}
+
+/// `POST /api/projects/:slug/packages` — create a child package. `parent_id`
+/// omitted means "default to root". The server mints the `id`.
+export async function createPackage(
+  slug: string,
+  body: { slug: string; parent_id?: string; label?: string },
+  signal?: AbortSignal,
+): Promise<Package> {
+  return request<Package>(
+    "POST",
+    `/api/projects/${encodeURIComponent(slug)}/packages`,
+    { body, signal },
+  );
+}
+
+/// `PATCH /api/projects/:slug/packages/:pkg` — rename and/or relabel.
+/// Slug rename atomically moves the on-disk folder server-side.
+export async function renamePackage(
+  slug: string,
+  pkgSlug: string,
+  body: { slug?: string; label?: string | null },
+  signal?: AbortSignal,
+): Promise<Package> {
+  return request<Package>(
+    "PATCH",
+    `/api/projects/${encodeURIComponent(slug)}/packages/${encodeURIComponent(pkgSlug)}`,
+    { body, signal },
+  );
+}
+
+/// `DELETE /api/projects/:slug/packages/:pkg` — deletes the package and
+/// every descendant. Rejected by the server with 409 if `pkgSlug` is the
+/// root package's slug.
+export async function deletePackage(
+  slug: string,
+  pkgSlug: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  await request<void>(
+    "DELETE",
+    `/api/projects/${encodeURIComponent(slug)}/packages/${encodeURIComponent(pkgSlug)}`,
+    { signal },
+  );
+}
+
+/// `GET /api/projects/:slug/packages/:pkg/graph` — load a single package's
+/// flow graph.
+export async function loadPackageGraph(
+  slug: string,
+  pkgSlug: string,
+  signal?: AbortSignal,
+): Promise<Graph> {
+  return request<Graph>(
+    "GET",
+    `/api/projects/${encodeURIComponent(slug)}/packages/${encodeURIComponent(pkgSlug)}/graph`,
+    { signal },
+  );
+}
+
+/// `PUT /api/projects/:slug/packages/:pkg/graph` — replace a single
+/// package's flow graph atomically.
+export async function savePackageGraph(
+  slug: string,
+  pkgSlug: string,
+  graph: Graph,
+  signal?: AbortSignal,
+): Promise<Graph> {
+  return request<Graph>(
+    "PUT",
+    `/api/projects/${encodeURIComponent(slug)}/packages/${encodeURIComponent(pkgSlug)}/graph`,
+    { body: graph, signal },
+  );
+}
+
 // ---- Build orchestration (Section 6) ---------------------------------------
 
 export interface ParsedDiagnostic {

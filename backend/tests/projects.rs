@@ -1860,6 +1860,174 @@ async fn test_put_package_graph_for_unknown_package_returns_404() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+// ----- T6: Section 1 closure — legacy migration + multi-package build E2E ----
+
+#[tokio::test]
+async fn test_legacy_single_graph_project_migrates_via_http_load() {
+    // Closure test for the T2 migration path, exercised through HTTP
+    // rather than the store layer directly. A pre-Section-1 project
+    // on disk (no `packages/` dir, top-level `graph.json`) must
+    // migrate cleanly when the studio loads it via the standard
+    // `GET /api/projects/:slug` route, and subsequent reads/writes
+    // must target the new layout.
+    let (app, dir) = harness().await;
+
+    // 1. Hand-craft a legacy project on disk. Mirrors the on-disk
+    //    shape the studio produced before Section 1 landed.
+    let project_root = dir.path().join("legacy-http");
+    std::fs::create_dir(&project_root).unwrap();
+    std::fs::write(
+        project_root.join("project.json"),
+        serde_json::to_vec_pretty(&json!({
+            "slug": "legacy-http",
+            "name": "Legacy via HTTP",
+            "created_at": "2025-01-01T00:00:00Z",
+            "updated_at": "2025-01-01T00:00:00Z",
+            "schema_version": 1
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        project_root.join("graph.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "nodes": [],
+            "edges": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // 2. Load via HTTP — must succeed AND synthesise the root package.
+    let (status, body) = send_json(
+        app.clone(),
+        Method::GET,
+        "/api/projects/legacy-http",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "legacy project must load via HTTP");
+    assert_eq!(body["slug"], "legacy-http");
+
+    // 3. Disk state: migration ran transparently.
+    assert!(
+        !project_root.join("graph.json").exists(),
+        "legacy graph.json should have been hoisted away during migration"
+    );
+    assert!(
+        project_root.join("packages").join("main").join("graph.json").exists(),
+        "graph must now live at packages/main/graph.json"
+    );
+
+    // 4. The packages endpoint shows the synthesised root.
+    let (s2, list_body) = send_json(
+        app.clone(),
+        Method::GET,
+        "/api/projects/legacy-http/packages",
+        None,
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK);
+    let pkgs = list_body["packages"].as_array().unwrap();
+    assert_eq!(pkgs.len(), 1);
+    assert_eq!(pkgs[0]["slug"], "main");
+}
+
+#[tokio::test]
+async fn test_multi_package_regen_compiles_under_cargo_check() {
+    // E2E closure test for Section 1: a project with a child
+    // package must regen into a Rust source tree that `cargo check`
+    // accepts. This is the canary test the T4 super-qa flagged as
+    // missing — without it, a regression in the nested-module
+    // codegen could land silently.
+    //
+    // Strategy: create project, add a child package, hit the
+    // build endpoint (which regens internally then runs `cargo
+    // check` via the BuildManager), wait for the build to exit,
+    // assert exit code 0.
+    let (_throwaway_app, dir) = harness().await;
+
+    // We need direct access to the build manager to subscribe to
+    // its event stream — `harness()` only returns the router, so
+    // rebuild the state stack here with the same root.
+    let store = ProjectStore::new(dir.path()).await.unwrap();
+    let registry = Arc::new(TemplateRegistry::with_builtins());
+    let state = AppState::new(store, registry);
+    let build_manager = state.build_manager.clone();
+    let app = router(state);
+
+    // 1. Create project.
+    let (s1, _) = send_json(
+        app.clone(),
+        Method::POST,
+        "/api/projects",
+        Some(&json!({"slug": "multi-build", "name": "Multi Build"})),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::CREATED);
+
+    // 2. Add a child package — leaving its graph empty exercises
+    //    the "stub mod.rs" path in T4's tree walker.
+    let (s2, _) = send_json(
+        app.clone(),
+        Method::POST,
+        "/api/projects/multi-build/packages",
+        Some(&json!({"slug": "billing"})),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::CREATED);
+
+    // 3. Trigger build. Returns 202 immediately; cargo runs async.
+    let (s3, _) = send_json(
+        app.clone(),
+        Method::POST,
+        "/api/projects/multi-build/build",
+        None,
+    )
+    .await;
+    assert_eq!(s3, StatusCode::ACCEPTED);
+
+    // 4. Wait for the build to exit (or time out — cargo check on
+    //    a tiny project should finish in well under 60s even on a
+    //    cold target dir).
+    let mut rx = build_manager.subscribe("multi-build");
+    let mut exit_code = None;
+    tokio::select! {
+        res = async {
+            loop {
+                if let Ok(event) = rx.recv().await {
+                    if let rust_no_code_studio::build::BuildEvent::Exit { code } = event {
+                        return Some(code);
+                    }
+                }
+            }
+        } => exit_code = res,
+        _ = tokio::time::sleep(tokio::time::Duration::from_secs(120)) => {}
+    }
+
+    assert_eq!(
+        exit_code,
+        Some(0),
+        "cargo check must succeed on a multi-package project; \
+         non-zero exit means generated source has a regression \
+         (likely in nested-module codegen from T4)"
+    );
+
+    // 5. Verify the nested module is actually on disk where T4
+    //    promised it would be.
+    let proj_root = dir.path().join("multi-build");
+    assert!(
+        proj_root.join("src").join("billing").join("mod.rs").exists(),
+        "child package mod.rs must be on disk after build-triggered regen"
+    );
+    let lib_src = std::fs::read_to_string(proj_root.join("src/lib.rs")).unwrap();
+    assert!(
+        lib_src.contains("pub mod billing;"),
+        "root lib.rs must declare the child package"
+    );
+}
+
 
 
 
